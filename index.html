@@ -689,7 +689,6 @@
     }
 
     const STORAGE_KEY = 'dunkin_qc_db_v1';
-    const SHEET_CONFIG_KEY = 'dunkin_qc_sheet_url';
 
     /* ---- 초기 시딩 데이터 (냉장 좌/우 품목 및 오늘자 기록) ----
        최초 실행 시(=localStorage가 비어있을 때) 아래 데이터로 자동 채워집니다.
@@ -759,23 +758,21 @@
       barcodeSeq: 31
     };
 
+    // Apps Script 배포 URL은 하드코딩으로 고정한다 (설정 화면에서 바꿀 수 없음).
+    const SHEET_URL = "https://script.google.com/macros/s/AKfycbyc77obfoRUl2UvHp34lcu17lY8t5V_0rzZmSZ4xZRcZGQMi0wnaNNi5F4oM-rVODX8/exec";
+
     const SheetSync = {
-      url: null,
+      url: SHEET_URL,
       connected: false,
 
       init() {
-        this.url = localStorage.getItem(SHEET_CONFIG_KEY) || null;
+        this.url = SHEET_URL;
         this.updateStatusUI();
       },
 
-      setUrl(url) {
-        this.url = url ? url.trim() : null;
-        if (this.url) {
-          localStorage.setItem(SHEET_CONFIG_KEY, this.url);
-        } else {
-          localStorage.removeItem(SHEET_CONFIG_KEY);
-        }
-        this.connected = false;
+      setUrl() {
+        // 하드코딩 사용 - 변경 불가
+        this.url = SHEET_URL;
         this.updateStatusUI();
       },
 
@@ -783,24 +780,20 @@
         const dot = document.getElementById('syncDot');
         const text = document.getElementById('syncText');
         if (!dot || !text) return;
-        if (!this.url) {
-          dot.classList.remove('on');
-          text.textContent = '시트 미연결';
-        } else if (this.connected) {
+        if (this.connected) {
           dot.classList.add('on');
           text.textContent = '시트 연결됨';
         } else {
           dot.classList.remove('on');
-          text.textContent = '시트 연결안됨';
+          text.textContent = '시트 연결중';
         }
       },
 
       // 서버에서 전체 데이터(products/entries)를 가져온다.
       // 실패해도 조용히 무시하고 로컬 데이터를 그대로 사용한다.
       async pullAll() {
-        if (!this.url) return null;
         try {
-          const res = await fetch(this.url + (this.url.includes('?') ? '&' : '?') + 'action=all');
+          const res = await fetch(`${this.url}?action=all`);
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const data = await res.json();
           this.connected = true;
@@ -815,7 +808,6 @@
       },
 
       async post(body) {
-        if (!this.url) return false;
         try {
           const res = await fetch(this.url, {
             method: 'POST',
@@ -1388,6 +1380,7 @@
       // 바코드 안에 GS1 소비기한(AI 17/15) 정보가 실려 있으면 그것도 함께 반영
       if (expiry) {
         entry.expiry = expiry;
+        entry.expiryCleared = false; // 새 소비기한이 실제로 등록됐으니 폐기 표시 해제
         messages.push(`소비기한 ${fmtD(expiry)} 등록`);
       }
 
@@ -1526,7 +1519,7 @@
                 pushLine(`  보관:${storageMethod}`);
               }
             } else {
-              const expiry = (entry && entry.expiry) || p.defaultExpiry;
+              const expiry = effectiveExpiry(p, entry);
               pushLine(`  소비기한:${expiry ? fmtD(expiry) : '__________'}  보관:${storageMethod}`);
             }
 
@@ -1589,11 +1582,22 @@
       });
       return out;
     }
+    // 품목의 "실제로 사용해야 할" 소비기한을 계산한다.
+    // entry.expiry가 있으면 그 값을, 없으면 품목마다 정해둔 기본 소비기한(defaultExpiry)을 대신 보여준다.
+    // 단, 폐기 처리(discardProduct)로 인해 값이 "명시적으로 비워진" 경우에는
+    // 새 소비기한이 실제로 입력되기 전까지 defaultExpiry로 되돌아가지 않게 막는다.
+    // (이 방어 로직이 없으면 폐기 처리해도 defaultExpiry가 다시 채워져서
+    //  "오늘 폐기 예정" 목록에서 우유 등 품목이 사라지지 않는 버그가 발생함)
+    function effectiveExpiry(p, entry) {
+      if (entry && entry.expiryCleared && !entry.expiry) return null;
+      return (entry && entry.expiry) || p.defaultExpiry || null;
+    }
+
     function allTrackedWithExpiry() {
       const out = [];
       DB.products.forEach(p => {
         const entry = DB.entries[p.id];
-        const expiry = (entry && entry.expiry) || p.defaultExpiry;
+        const expiry = effectiveExpiry(p, entry);
         if (!expiry) return;
         out.push({ product: p, expiry });
       });
@@ -1617,6 +1621,9 @@
       } else {
         // 일반 품목: 소비기한/기준일자를 비워서 목록에서 제거되도록 함
         entry.expiry = null;
+        // defaultExpiry로 자동 대체되지 않도록 "명시적으로 비웠다"는 표시를 남김.
+        // 새 제품을 스캔하거나 소비기한을 직접 입력하면(saveEntry/handleScan) 이 플래그는 해제된다.
+        entry.expiryCleared = true;
         if (reason !== 'expiry') {
           entry.baseDate = null; // 안전보관일 사유면 기준일도 초기화
         }
@@ -1853,7 +1860,7 @@
         <div class="field-row">
           <div style="flex:1;">
             <label>소비기한</label>
-            <input type="date" class="expiry-input" value="${(entry.expiry || p.defaultExpiry || '')}">
+            <input type="date" class="expiry-input" value="${effectiveExpiry(p, entry) || ''}">
           </div>
         </div>
         `}
@@ -1877,7 +1884,10 @@
           } else if (basisInput) {
             entry.baseDate = basisInput.value || null;
           }
-          if (expiryInput) entry.expiry = expiryInput.value || null;
+          if (expiryInput) {
+            entry.expiry = expiryInput.value || null;
+            if (entry.expiry) entry.expiryCleared = false; // 직접 입력했으니 폐기 표시 해제
+          }
           entry.updatedAt = new Date().toISOString();
           DB.entries[pid] = entry;
           await persist();
@@ -2298,80 +2308,6 @@
     }
 
     document.getElementById('connBtn').addEventListener('click', connectPrinter);
-
-    const SHEET_URL = "https://script.google.com/macros/s/AKfycbyc77obfoRUl2UvHp34lcu17lY8t5V_0rzZmSZ4xZRcZGQMi0wnaNNi5F4oM-rVODX8/exec";
-
-    const SheetSync = {
-      url: SHEET_URL,
-      connected: false,
-
-      init() {
-        this.url = SHEET_URL;
-        this.updateStatusUI();
-      },
-
-      setUrl() {
-        // 하드코딩 사용 - 변경 불가
-        this.url = SHEET_URL;
-        this.updateStatusUI();
-      },
-
-      updateStatusUI() {
-        const dot = document.getElementById('syncDot');
-        const text = document.getElementById('syncText');
-        if (!dot || !text) return;
-
-        if (this.connected) {
-          dot.classList.add('on');
-          text.textContent = '시트 연결됨';
-        } else {
-          dot.classList.remove('on');
-          text.textContent = '시트 연결중';
-        }
-      },
-
-      async pullAll() {
-        try {
-          const res = await fetch(`${this.url}?action=all`);
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-
-          const data = await res.json();
-          this.connected = true;
-          this.updateStatusUI();
-          return data;
-
-        } catch (e) {
-          console.error('시트 불러오기 실패:', e);
-          this.connected = false;
-          this.updateStatusUI();
-          return null;
-        }
-      },
-
-      async post(body) {
-        try {
-          const res = await fetch(this.url, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'text/plain;charset=utf-8'
-            },
-            body: JSON.stringify(body)
-          });
-
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-
-          this.connected = true;
-          this.updateStatusUI();
-          return true;
-
-        } catch (e) {
-          console.error('시트 저장 실패:', e);
-          this.connected = false;
-          this.updateStatusUI();
-          return false;
-        }
-      }
-    };
 
     /* ---------- 전역 바코드 스캔 입력창 ---------- */
     const globalScanInput = document.getElementById('globalScanInput');
