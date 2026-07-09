@@ -690,28 +690,39 @@
 
     const STORAGE_KEY = 'dunkin_qc_db_v1';
 
+    // 보관방법별 "기본 소비기한" 추천 일수 — 냉장은 2주, 냉동은 6개월(약 180일).
+    // 실온/상온은 품목마다 편차가 커서 자동 추천하지 않는다.
+    const DEFAULT_EXPIRY_DAYS = { '냉장': 14, '냉동': 180 };
+    function suggestedDefaultExpiry(storageMethod) {
+      const days = DEFAULT_EXPIRY_DAYS[storageMethod];
+      if (!days) return null;
+      const d = new Date();
+      d.setDate(d.getDate() + days);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    }
+
     /* ---- 초기 시딩 데이터 (냉장 좌/우 품목 및 오늘자 기록) ----
        최초 실행 시(=localStorage가 비어있을 때) 아래 데이터로 자동 채워집니다.
        이후에는 앱 내 '제품 관리' 화면 및 각 구역 화면에서 직접 값을 수정/저장하면 됩니다. */
     const SEED_DATA = {
       products: [
         // ---- 냉장(좌) ----
-        { id: 'p001', zone: 'left', category: '기본 식자재', name: '에그패티', basis: 'thaw', durationValue: 72, durationUnit: 'hour', defaultExpiry: null, order: 0, barcode: '90000001' },
+        { id: 'p001', zone: 'left', category: '기본 식자재', name: '에그패티', basis: 'thaw', durationValue: 72, durationUnit: 'hour', defaultExpiry: '2026-07-23', order: 0, barcode: '90000001' },
         { id: 'p002', zone: 'left', category: '기본 식자재', name: '머핀빵', basis: 'thaw', durationValue: 48, durationUnit: 'hour', defaultExpiry: '2026-07-26', order: 1, barcode: '90000002' },
-        { id: 'p003', zone: 'left', category: '기본 식자재', name: '베이컨', basis: 'thaw', durationValue: 48, durationUnit: 'hour', defaultExpiry: null, order: 2, barcode: '90000003' },
+        { id: 'p003', zone: 'left', category: '기본 식자재', name: '베이컨', basis: 'thaw', durationValue: 48, durationUnit: 'hour', defaultExpiry: '2026-07-23', order: 2, barcode: '90000003' },
         { id: 'p004', zone: 'left', category: '기본 식자재', name: '글레이즈드', basis: 'subdiv', durationValue: 3, durationUnit: 'day', defaultExpiry: '2026-07-13', order: 3, barcode: '90000004' },
         { id: 'p005', zone: 'left', category: '기본 식자재', name: '케찹', basis: 'subdiv', durationValue: 5, durationUnit: 'day', defaultExpiry: '2026-08-10', order: 4, barcode: '90000005' },
         { id: 'p006', zone: 'left', category: '기본 식자재', name: '머스타드', basis: 'subdiv', durationValue: 5, durationUnit: 'day', defaultExpiry: '2026-08-10', order: 5, barcode: '90000006' },
-        { id: 'p007', zone: 'left', category: '기본 식자재', name: '랠리쉬', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: null, order: 6, barcode: '90000007' },
-        { id: 'p008', zone: 'left', category: '필링/소스', name: '휘핑크림', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: null, order: 7, barcode: '90000008' },
+        { id: 'p007', zone: 'left', category: '기본 식자재', name: '랠리쉬', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 6, barcode: '90000007' },
+        { id: 'p008', zone: 'left', category: '필링/소스', name: '휘핑크림', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 7, barcode: '90000008' },
         { id: 'p009', zone: 'left', category: '필링/소스', name: '크림치즈', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: '2026-09-26', order: 8, barcode: '90000009' },
-        { id: 'p010', zone: 'left', category: '필링/소스', name: '필링', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: null, order: 9, barcode: '90000010' },
-        { id: 'p011', zone: 'left', category: '필링/소스', name: '페이스트', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: null, order: 10, barcode: '90000011' },
+        { id: 'p010', zone: 'left', category: '필링/소스', name: '필링', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 9, barcode: '90000010' },
+        { id: 'p011', zone: 'left', category: '필링/소스', name: '페이스트', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 10, barcode: '90000011' },
         { id: 'p012', zone: 'left', category: '기본 식자재', name: '핫도그', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: '2026-11-28', order: 11, barcode: '90000012' },
 
         // ---- 냉장(우) ----
         { id: 'p101', zone: 'right', category: '음료/토핑', name: '아이스티', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: '2027-03-26', order: 0, barcode: '90000013' },
-        { id: 'p102', zone: 'right', category: '음료/토핑', name: '휘핑', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: null, order: 1, barcode: '90000014' },
+        { id: 'p102', zone: 'right', category: '음료/토핑', name: '휘핑', basis: 'expiryOnly', durationValue: 0, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 1, barcode: '90000014' },
         { id: 'p103', zone: 'right', category: '음료/토핑', name: '우유', basis: 'expiryOnly', durationValue: 3, durationUnit: 'day', defaultExpiry: '2026-07-08', order: 2, barcode: '90000015' },
         { id: 'p104', zone: 'right', category: '필링/소스', name: '허쉬초코시럽', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: '2027-01-08', order: 3, barcode: '90000016' },
         { id: 'p105', zone: 'right', category: '필링/소스', name: '카라멜시럽', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: '2027-04-27', order: 4, barcode: '90000017' },
@@ -722,13 +733,13 @@
         { id: 'p110', zone: 'right', category: '음료/베이스', name: '납작복숭아', basis: 'open', durationValue: 30, durationUnit: 'day', defaultExpiry: '2028-08-07', order: 9, barcode: '90000022' },
         { id: 'p111', zone: 'right', category: '음료/베이스', name: '레몬베이스', basis: 'open', durationValue: 30, durationUnit: 'day', defaultExpiry: '2027-10-12', order: 10, barcode: '90000023' },
         { id: 'p112', zone: 'right', category: '음료/베이스', name: '구아바오렌지', basis: 'thaw', durationValue: 30, durationUnit: 'day', defaultExpiry: '2028-04-07', order: 11, barcode: '90000024' },
-        { id: 'p113', zone: 'right', category: '음료/베이스', name: '망고베이스', basis: 'thaw', durationValue: 14, durationUnit: 'day', defaultExpiry: null, order: 12, barcode: '90000025' },
-        { id: 'p114', zone: 'right', category: '음료/베이스', name: '딸기연유라떼', basis: 'thaw', durationValue: 3, durationUnit: 'day', defaultExpiry: null, order: 13, barcode: '90000026' },
-        { id: 'p115', zone: 'right', category: '음료/토핑', name: '팥', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: null, order: 14, barcode: '90000027' },
+        { id: 'p113', zone: 'right', category: '음료/베이스', name: '망고베이스', basis: 'thaw', durationValue: 14, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 12, barcode: '90000025' },
+        { id: 'p114', zone: 'right', category: '음료/베이스', name: '딸기연유라떼', basis: 'thaw', durationValue: 3, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 13, barcode: '90000026' },
+        { id: 'p115', zone: 'right', category: '음료/토핑', name: '팥', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 14, barcode: '90000027' },
         { id: 'p116', zone: 'right', category: '음료/토핑', name: '스노우빙(망고)', basis: 'thaw', durationValue: 2, durationUnit: 'day', defaultExpiry: '2029-04-28', order: 15, barcode: '90000028' },
         { id: 'p117', zone: 'right', category: '음료/토핑', name: '연유', basis: 'open', durationValue: 7, durationUnit: 'day', defaultExpiry: '2026-11-23', order: 16, barcode: '90000029' },
-        { id: 'p118', zone: 'right', category: '음료/토핑', name: '인절미', basis: 'thaw', durationValue: 4, durationUnit: 'day', defaultExpiry: null, order: 17, barcode: '90000030' },
-        { id: 'p119', zone: 'right', category: '음료/베이스', name: '오렌지베이스', basis: 'thaw', durationValue: 14, durationUnit: 'day', defaultExpiry: null, order: 18, barcode: '90000031' },
+        { id: 'p118', zone: 'right', category: '음료/토핑', name: '인절미', basis: 'thaw', durationValue: 4, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 17, barcode: '90000030' },
+        { id: 'p119', zone: 'right', category: '음료/베이스', name: '오렌지베이스', basis: 'thaw', durationValue: 14, durationUnit: 'day', defaultExpiry: '2026-07-23', order: 18, barcode: '90000031' },
       ],
       entries: {
         p001: { baseDate: '2026-07-01T16:00', expiry: null },
@@ -758,7 +769,7 @@
       barcodeSeq: 31
     };
 
-    // Apps Script 배포 URL은 하드코딩으로 고정한다 (설정 화면에서 바꿀 수 없음).
+    // 서버 주소는 하드코딩 사용 - 변경 불가 (설정 화면/로컬스토리지로 바꿀 수 없음)
     const SHEET_URL = "https://script.google.com/macros/s/AKfycbyc77obfoRUl2UvHp34lcu17lY8t5V_0rzZmSZ4xZRcZGQMi0wnaNNi5F4oM-rVODX8/exec";
 
     const SheetSync = {
@@ -785,15 +796,16 @@
           text.textContent = '시트 연결됨';
         } else {
           dot.classList.remove('on');
-          text.textContent = '시트 연결중';
+          text.textContent = '시트 연결안됨';
         }
       },
 
       // 서버에서 전체 데이터(products/entries)를 가져온다.
       // 실패해도 조용히 무시하고 로컬 데이터를 그대로 사용한다.
       async pullAll() {
+        if (!this.url) return null;
         try {
-          const res = await fetch(`${this.url}?action=all`);
+          const res = await fetch(this.url + (this.url.includes('?') ? '&' : '?') + 'action=all');
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const data = await res.json();
           this.connected = true;
@@ -808,6 +820,7 @@
       },
 
       async post(body) {
+        if (!this.url) return false;
         try {
           const res = await fetch(this.url, {
             method: 'POST',
@@ -1519,7 +1532,7 @@
                 pushLine(`  보관:${storageMethod}`);
               }
             } else {
-              const expiry = effectiveExpiry(p, entry);
+              const expiry = (entry && entry.expiry) || p.defaultExpiry;
               pushLine(`  소비기한:${expiry ? fmtD(expiry) : '__________'}  보관:${storageMethod}`);
             }
 
@@ -2081,8 +2094,9 @@
         </div>
       </div>
 
-      <label>기본 소비기한(선택)</label>
+      <label>기본 소비기한(선택) <span id="f-expiry-hint" style="font-weight:400; color:var(--muted);"></span></label>
       <input id="f-expiry" type="date" value="${existing?.defaultExpiry || ''}">
+      <div style="font-size:0.72rem; color:var(--muted); margin-top:4px;">비워두면 보관방법 기준으로 자동 추천됩니다 (냉장 2주 / 냉동 6개월).</div>
 
       <label style="display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer;">
         <input type="checkbox" id="f-stock-tracking" style="width:auto;" ${existing?.stockTracking ? 'checked' : ''}>
@@ -2112,6 +2126,25 @@
       }
       basisSel.addEventListener('change', toggleDur);
       toggleDur();
+
+      // 기본 소비기한 자동 추천: 보관방법을 바꾸면(냉장↔냉동 등) 추천값을 다시 계산해서
+      // 채워준다. 단, 사용자가 직접 값을 입력해뒀다면 덮어쓰지 않는다.
+      const storageSel = overlay.querySelector('#f-storage');
+      const expiryFieldEl = overlay.querySelector('#f-expiry');
+      const expiryHintEl = overlay.querySelector('#f-expiry-hint');
+      let expiryManuallyEdited = !!(existing && existing.defaultExpiry);
+      function updateExpiryHint() {
+        const suggestion = suggestedDefaultExpiry(storageSel.value);
+        expiryHintEl.textContent = suggestion ? `(추천 ${fmtD(suggestion)})` : '';
+        if (!expiryManuallyEdited && suggestion) {
+          expiryFieldEl.value = suggestion;
+        }
+      }
+      storageSel.addEventListener('change', updateExpiryHint);
+      expiryFieldEl.addEventListener('input', () => {
+        expiryManuallyEdited = expiryFieldEl.value.trim() !== '';
+      });
+      updateExpiryHint();
 
       // 폼 안의 "지금 스캔" 버튼: 포커스를 바코드 입력창으로 옮겨서
       // 스캐너가 바로 이 칸에 값을 입력하도록 돕는다 (GTIN 부분만 추출해서 채움)
@@ -2143,6 +2176,7 @@
           barcodeInput.value = parsed.gtin;
           if (parsed.expiry) {
             overlay.querySelector('#f-expiry').value = parsed.expiry;
+            expiryManuallyEdited = true; // 실제 스캔된 값이므로 이후 보관방법 변경으로 덮어쓰지 않음
           }
           updateBarcodePreview();
         }
