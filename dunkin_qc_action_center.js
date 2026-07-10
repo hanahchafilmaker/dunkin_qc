@@ -33,6 +33,22 @@
    ④ 위치별 재고 현황 카드
    ⑤ 입고 대기 목록 패널
    ⑥ 60초마다 홈 화면 자동 새로고침
+
+   ---------------------------------------------------------
+   [수정 내역] 입고(receive) 액션 버그 수정
+   ---------------------------------------------------------
+   - 기존에는 입고 모달에 소비기한 입력 필드가 없었고, 확인을 눌러도
+     entry.lots에 실제로 반영되지 않아 화면/시트 수량이 갱신되지 않는
+     문제가 있었습니다.
+   - 이번 수정에서:
+     1) 입고(receive) 액션에도 소비기한 입력 필드를 노출합니다.
+     2) 재고관리(stockTracking) 품목은 원본 openQuickReceiveModal과
+        동일하게 entry.lots에 로트를 합산/추가합니다.
+     3) 재고관리 대상이 아닌 일반 품목은 entry.qty를 누적하고
+        entry.expiry를 갱신해 화면(재고 목록)에도 즉시 반영되도록
+        분기 처리했습니다.
+     4) LocationTransition.receive 호출 시 expiryDate를 함께 전달해
+        서버(INVENTORY) 쪽에도 소비기한이 정확히 반영되도록 했습니다.
    ========================================================= */
 (function () {
   'use strict';
@@ -144,6 +160,9 @@
 
   /* ---------------------------------------------------------
      4. STEP 5 — prompt() 없는 전용 입력 모달 (수량/위치/날짜/사유)
+        [수정] 소비기한 입력 필드를 'receive'(입고) 액션에도 노출.
+        - subdivide: 식품 소비기한(통 교체일과는 별개) 라벨 사용
+        - receive : 일반적인 "소비기한" 라벨 사용
      --------------------------------------------------------- */
   function openInventoryInputModal(action, product) {
     currentAction = action;
@@ -154,8 +173,12 @@
       .join('');
 
     const showLocation = action === 'move';
-    const showExpiry = action === 'subdivide';
+    const showExpiry = action === 'subdivide' || action === 'receive';
     const showReason = action === 'discard';
+
+    const expiryLabel = action === 'receive'
+      ? '소비기한'
+      : '식품 소비기한 <span style="color:var(--muted); font-weight:400;">(통 교체일과는 별개로 관리됩니다)</span>';
 
     const overlay = makeOverlay(`
       <h3>${product.name} · ${actionLabel(action)}</h3>
@@ -166,7 +189,7 @@
         <select id="inv-location">${zoneOptions}</select>
       </div>
       <div id="inv-expiry-field" style="${showExpiry ? '' : 'display:none;'}">
-        <label>식품 소비기한 <span style="color:var(--muted); font-weight:400;">(통 교체일과는 별개로 관리됩니다)</span></label>
+        <label>${expiryLabel}</label>
         <input type="date" id="inv-expiry">
       </div>
       <div id="inv-reason-field" style="${showReason ? '' : 'display:none;'}">
@@ -197,6 +220,16 @@
      5. STEP 5-7 — 저장: 기존 LocationTransition(서버 반영)과
         기존 로컬 저장 흐름(persist/persistEntry/consumeProduct/
         discardProduct)을 그대로 사용해, 화면이 즉시 갱신되도록 처리.
+
+        [수정] receive 케이스:
+        - 재고관리(stockTracking) 품목: 원본 openQuickReceiveModal과
+          동일하게 같은 소비기한의 로트가 있으면 수량만 합산, 없으면
+          새 로트를 push.
+        - 일반 품목(stockTracking:false): entry.qty를 누적하고
+          entry.expiry를 갱신 → 구역 화면의 소비기한 입력창에도
+          즉시 반영됨.
+        - 두 경우 모두 LocationTransition.receive에 expiryDate를
+          함께 전달해 서버(INVENTORY) 값도 정확히 반영.
      --------------------------------------------------------- */
   async function submitInventoryAction(overlay) {
     const product = currentInventoryProduct;
@@ -207,14 +240,34 @@
     try {
       switch (currentAction) {
         case 'receive': {
-          entry.lots = entry.lots || [];
+          const expiryInput = overlay.querySelector('#inv-expiry');
+          const expiry = expiryInput ? (expiryInput.value || null) : null;
+
+          if (product.stockTracking) {
+            // 재고관리 품목: 로트(수량+소비기한) 단위로 관리
+            entry.lots = entry.lots || [];
+            const existingLot = entry.lots.find(l => l.expiry === expiry);
+            if (existingLot) {
+              existingLot.qty = (existingLot.qty || 0) + qty;
+            } else {
+              entry.lots.push({ qty, expiry, opened: false, baseDate: nowLocalInputValue() });
+            }
+          } else {
+            // 일반 품목: 단일 수량/소비기한 값을 직접 누적·갱신
+            entry.qty = (entry.qty || 0) + qty;
+            if (expiry) {
+              entry.expiry = expiry;
+              entry.expiryCleared = false; // 새 소비기한이 입력됐으니 폐기 표시 해제
+            }
+          }
+
           entry.status = entry.status || '정상';
           entry.updatedAt = new Date().toISOString();
           DB.entries[product.id] = entry;
           await persistEntry(product.id);
           await LocationTransition.receive({
             barcode: product.barcode, productName: product.name, category: product.category,
-            zoneKey: product.zone, quantity: qty, operator: '관리자'
+            zoneKey: product.zone, quantity: qty, expiryDate: expiry, operator: '관리자'
           });
           toast(`${product.name} ${qty}개 입고 처리`);
           break;
