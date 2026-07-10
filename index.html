@@ -318,6 +318,29 @@
       color: var(--red);
     }
 
+    /* ---- 위치별 우선순위 알림(냉장-우 FRG_R_THAW 2일 임박) 전용 강조 배지 ---- */
+    .safe-pill.priority-danger {
+      background: #ff2d2d;
+      color: #fff;
+      font-weight: 900;
+      box-shadow: 0 0 0 2px #ff2d2d55;
+      animation: priorityPulse 1.4s infinite;
+    }
+
+    @keyframes priorityPulse {
+      0% {
+        box-shadow: 0 0 0 0 #ff2d2d88;
+      }
+
+      70% {
+        box-shadow: 0 0 0 8px #ff2d2d00;
+      }
+
+      100% {
+        box-shadow: 0 0 0 0 #ff2d2d00;
+      }
+    }
+
     .barcode-tag {
       margin-top: 8px;
       font-size: 0.72rem;
@@ -652,6 +675,7 @@
   <div class="scanbar">
     <span class="ic">📷</span>
     <input type="text" id="globalScanInput" placeholder="바코드를 스캔하세요 (상품명·소비기한 자동 인식)" autocomplete="off">
+    <button type="button" class="small" id="receiveModeBtn" style="flex:0 0 auto;">📥 빠른입고</button>
   </div>
 
   <main id="viewRoot"></main>
@@ -670,6 +694,38 @@
       { key: 'freezerBottom', label: '대형냉동고(하)' },
       { key: 'room', label: '상온' },
     ];
+
+    /* ---------------------------------------------------------
+       1-1. 위치 마스터 코드 매핑 (dashboard_extension.js 통합)
+       ZONES(key: left/right/freezer/freezerTop/freezerBottom/room)를
+       백엔드(inventory_backend.gs)의 위치 코드(FRG_L_BEV 등)와
+       주고받기 위한 매핑. 위치별 알림 규칙도 프론트에 함께 두어
+       (백엔드 LOCATION_MASTER와 동일한 값) UI에서 즉시 표시할 수 있게 한다.
+       --------------------------------------------------------- */
+    const LOCATION_CODE_MAP = {
+      left: 'FRG_L_BEV',
+      right: 'FRG_R_THAW',
+      freezer: 'FRZ_SML',
+      freezerTop: 'FRZ_BIG_TOP',
+      freezerBottom: 'FRZ_BIG_BOT',
+      room: 'ROOM_TEMP',
+    };
+    const LOCATION_CODE_REVERSE = Object.fromEntries(
+      Object.entries(LOCATION_CODE_MAP).map(([zoneKey, code]) => [code, zoneKey])
+    );
+    // 위치별 알림 규칙: FRG_R_THAW(냉장-우)는 해동/소분 집중 구역 → 48h(2일) 임박 시 적색 강조.
+    // FRZ_BIG_TOP(대형냉동-상)은 입고 빈번 → 입고 시 수량 모달을 최우선으로 띄운다.
+    const LOCATION_ALERT_RULES = {
+      FRG_L_BEV: { warnHours: 24, priorityAlert: false, receivePriority: false },
+      FRG_R_THAW: { warnHours: 48, priorityAlert: true, receivePriority: false },
+      FRZ_SML: { warnHours: 24, priorityAlert: false, receivePriority: false },
+      FRZ_BIG_TOP: { warnHours: 24, priorityAlert: false, receivePriority: true },
+      FRZ_BIG_BOT: { warnHours: 24, priorityAlert: false, receivePriority: false },
+      ROOM_TEMP: { warnHours: 24, priorityAlert: false, receivePriority: false },
+    };
+    function locationCodeForZone(zoneKey) { return LOCATION_CODE_MAP[zoneKey] || 'ROOM_TEMP'; }
+    function zoneKeyForLocationCode(code) { return LOCATION_CODE_REVERSE[code] || 'left'; }
+
     const DEFAULT_CATEGORIES = ['기본 식자재', '필링/소스', '음료/베이스', '음료/토핑', '기타'];
     const BASIS = {
       subdiv: { label: '소분일 포함', dateLabel: '소분일', calc: true, track: true },
@@ -681,6 +737,63 @@
     // 위 다섯 가지 중 어디에도 안 걸리는 값(예: 예전 데이터의 'none'/'manual')이 들어왔을 때 쓸 기본값.
     // UI 선택지에는 노출되지 않고, 방어적 fallback 용도로만 사용.
     const BASIS_FALLBACK = BASIS.expiryOnly;
+
+    // ---------------------------------------------------------
+    // 소분 품목 듀얼룰(Dual-Rule) 지원 (dashboard_extension.js 통합)
+    // 요구사항: 소분통 교체(7일, containerDue) 와 식품 자체 소비기한(foodExpiry)을
+    // 서로 "독립적으로" 관리한다. 기존 BASIS.subdiv는 하나의 안전보관일만
+    // 계산했으므로, 소분(subdiv) 품목에 한해 두 값을 모두 계산/표시하도록 확장.
+    // ---------------------------------------------------------
+    // product.containerCycleDays가 없으면 기본 7일 사용
+    const DEFAULT_CONTAINER_CYCLE_DAYS = 7;
+
+    // entry.baseDate(소분일)로부터 "소분통 교체 예정일" 계산 — 항상 7일(또는 품목별 지정 주기) 고정 주기
+    function computeContainerDue(product, entry) {
+      if (product.basis !== 'subdiv') return null;
+      if (!entry || !entry.baseDate) return null;
+      const base = new Date(entry.baseDate);
+      if (isNaN(base)) return null;
+      const cycleDays = product.containerCycleDays || DEFAULT_CONTAINER_CYCLE_DAYS;
+      const due = new Date(base.getTime() + cycleDays * 86400000);
+      return due.toISOString().slice(0, 16);
+    }
+
+    // 식품 자체 소비기한은 entry.expiry (또는 product.defaultExpiry)를 그대로 사용 —
+    // 소분통 교체일과는 완전히 별개의 값이므로 재계산하지 않는다.
+    function foodExpiryOf(product, entry) {
+      return (entry && entry.expiry) || product.defaultExpiry || null;
+    }
+
+    // ---------------------------------------------------------
+    // 제품 유형(원팩 / 해동형 / 개봉형) — 물리적 상태·흐름 기준 분류.
+    // 별도 필드를 새로 저장하지 않고 기존 basis 코드로부터 파생시킨다.
+    //   - 냉동 즉시 사용(원팩)   → basis: expiryOnly
+    //   - 냉장 해동 필수(해동형) → basis: thaw
+    //   - 소분/개봉형(개봉형)    → basis: open / openOnly / subdiv
+    // ---------------------------------------------------------
+    function getProductType(product) {
+      if (product.basis === 'thaw') return '해동형';
+      if (product.basis === 'open' || product.basis === 'openOnly' || product.basis === 'subdiv') return '개봉형';
+      return '원팩';
+    }
+
+    // 유형별로 노출할 액션 버튼 HTML. 클릭 이벤트는 renderProductList에서 위임 처리.
+    function renderActionButtons(productType) {
+      if (productType === '해동형') {
+        return `
+          <button type="button" class="small act-btn" data-action="thawStart">🧊→🧊 냉장 해동 시작</button>
+          <button type="button" class="small act-btn" data-action="consume">✅ 소진</button>
+        `;
+      }
+      if (productType === '개봉형') {
+        return `
+          <button type="button" class="small act-btn" data-action="openStart">🔓 개봉일 기록 · 안전보관일 시작</button>
+          <button type="button" class="small act-btn" data-action="consume">✅ 소진</button>
+        `;
+      }
+      // 원팩: 해동/개봉 과정 없이 소비기한만 관리 → 사용 완료(차감)만 노출
+      return `<button type="button" class="small act-btn" data-action="consume">✅ 사용 완료(차감)</button>`;
+    }
 
     // 보관방법 표시용 (품목별로 직접 지정 가능, 미지정 시 구역으로부터 추론)
     const STORAGE_METHODS = ['실온', '냉장', '냉동', '상온'];
@@ -772,17 +885,26 @@
     // 서버 주소는 하드코딩 사용 - 변경 불가 (설정 화면/로컬스토리지로 바꿀 수 없음)
     const SHEET_URL = "https://script.google.com/macros/s/AKfycbyc77obfoRUl2UvHp34lcu17lY8t5V_0rzZmSZ4xZRcZGQMi0wnaNNi5F4oM-rVODX8/exec";
 
+    // ---------------------------------------------------------
+    // Apps Script Web API 연동 (products / scan / inventory / qc / qcLog / receive / move / thaw / subdivide / use / discard / alerts)
+    // GET  ?action=products                → 제품 기준(PRODUCTS 시트) 전체
+    // GET  ?action=inventory                → 현재 재고(INVENTORY 시트, 수량 포함) 전체
+    // GET  ?action=scan&barcode=...         → 바코드 1건 조회(제품 기준 + 현재 재고)
+    // GET  ?action=alerts                   → 통합 우선순위 알림(안전보관일/소분통 교체/식품 소비기한)
+    // POST {action:'qc', ...}               → 해동/개봉/소분/사용완료 등 상태 변경 + 수량 반영 (구버전 호환)
+    // POST {action:'inventory', ...}        → 재고(수량) 직접 저장/보정
+    // POST {action:'qcLog', ...}            → QC_LOG에 직접 기록만 남기기
+    // POST {action:'receive'|'move'|'thaw'|'subdivide'|'use'|'discard', ...} → 6단계 위치 전환 액션
+    //
+    // ※ inventory/scan 응답의 정확한 필드명은 실제 Apps Script(getInventory/scanBarcode)
+    //   구현에 맞춰 조정이 필요할 수 있습니다. 아래는 두 분이 공유해주신 예시를 기준으로
+    //   가장 자연스러운 필드명(quantity, baseDate, expiry, storage, opened 등)을 가정했습니다.
+    // ---------------------------------------------------------
     const SheetSync = {
       url: SHEET_URL,
       connected: false,
 
       init() {
-        this.url = SHEET_URL;
-        this.updateStatusUI();
-      },
-
-      setUrl() {
-        // 하드코딩 사용 - 변경 불가
         this.url = SHEET_URL;
         this.updateStatusUI();
       },
@@ -800,27 +922,26 @@
         }
       },
 
-      // 서버에서 전체 데이터(products/entries)를 가져온다.
-      // 실패해도 조용히 무시하고 로컬 데이터를 그대로 사용한다.
-      async pullAll() {
+      async _get(params) {
         if (!this.url) return null;
         try {
-          const res = await fetch(this.url + (this.url.includes('?') ? '&' : '?') + 'action=all');
+          const qs = new URLSearchParams(params).toString();
+          const res = await fetch(this.url + (this.url.includes('?') ? '&' : '?') + qs);
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const data = await res.json();
           this.connected = true;
           this.updateStatusUI();
           return data;
         } catch (e) {
-          console.error('시트 불러오기 실패:', e);
+          console.error('API GET 실패:', params, e);
           this.connected = false;
           this.updateStatusUI();
           return null;
         }
       },
 
-      async post(body) {
-        if (!this.url) return false;
+      async _post(body) {
+        if (!this.url) return null;
         try {
           const res = await fetch(this.url, {
             method: 'POST',
@@ -828,21 +949,132 @@
             body: JSON.stringify(body)
           });
           if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
           this.connected = true;
           this.updateStatusUI();
-          return true;
+          return data;
         } catch (e) {
-          console.error('시트 저장 실패:', e);
+          console.error('API POST 실패:', body, e);
           this.connected = false;
           this.updateStatusUI();
-          return false;
+          return null;
         }
       },
 
-      async saveEntry(entry) { return this.post({ action: 'saveEntry', entry }); },
-      async deleteEntry(productId) { return this.post({ action: 'deleteEntry', productId }); },
-      async saveProducts(products) { return this.post({ action: 'saveProducts', products }); }
+      // 제품 기준 전체 조회 → 실패 시 null (호출부에서 로컬 데이터 유지)
+      async getProducts() {
+        const r = await this._get({ action: 'products' });
+        return (r && r.success && Array.isArray(r.data)) ? r.data : null;
+      },
+
+      // 현재 재고(수량 포함) 전체 조회
+      async getInventory() {
+        const r = await this._get({ action: 'inventory' });
+        return (r && r.success && Array.isArray(r.data)) ? r.data : null;
+      },
+
+      // 바코드 1건 스캔 조회. 매 스캔마다 서버를 호출해 최신 기준/재고를 가져온다.
+      async scanBarcode(barcode) {
+        return await this._get({ action: 'scan', barcode });
+      },
+
+      // 해동/개봉/소분/사용완료 등 QC 상태 변경 (수량 차감/이동 포함)
+      // payload 예: { barcode, action:'해동', beforeStorage:'냉동', afterStorage:'냉장', quantity:1, operator:'관리자' }
+      async postQC(payload) {
+        return await this._post({ action: 'qc', ...payload });
+      },
+
+      // 재고(수량) 직접 저장/보정 — 입고, 재고 실사 보정 등
+      async saveInventory(payload) {
+        return await this._post({ action: 'inventory', ...payload });
+      },
+
+      // QC_LOG에 별도 기록만 남기고 싶을 때 (상태/수량 변경 없이)
+      async saveQCLog(payload) {
+        return await this._post({ action: 'qcLog', ...payload });
+      }
     };
+
+    /* -----------------------------------------------------------------------
+       1-2. 6단계 위치 전환 액션 — 서버 호출 래퍼 (dashboard_extension.js 통합)
+       기존 SheetSync.postQC()/saveInventory()는 그대로 유지하되, 요구사항에
+       명시된 6개 액션(입고/이동/해동/소분/사용/폐기)을 명시적으로 호출할 수
+       있는 래퍼를 추가한다. 백엔드(inventory_backend.gs)의 doPost 액션과 1:1 대응.
+       ----------------------------------------------------------------------- */
+    const LocationTransition = {
+      // 입고: 외부 → 창고(구역). FRZ_BIG_TOP(대형냉동-상)은 receivePriority=true를
+      // 돌려받으므로, 호출부에서 이 값을 보고 수량 입력 모달을 다른 구역보다
+      // 먼저(최우선으로) 띄우면 된다.
+      async receive({ barcode, productName, category, zoneKey, quantity, expiryDate, operator }) {
+        const res = await SheetSync._post({
+          action: 'receive', barcode, productName, category,
+          toLocation: locationCodeForZone(zoneKey), quantity, expiryDate, operator: operator || '관리자'
+        });
+        return res; // res.receivePriority === true 이면 최우선 모달 처리
+      },
+
+      // 이동: 위치 A → 위치 B
+      async move({ barcode, fromZoneKey, toZoneKey, quantity, operator }) {
+        return await SheetSync._post({
+          action: 'move', barcode,
+          fromLocation: locationCodeForZone(fromZoneKey), toLocation: locationCodeForZone(toZoneKey),
+          quantity, operator: operator || '관리자'
+        });
+      },
+
+      // 해동: 냉동 → FRG_R_THAW(냉장-우)
+      async thaw({ barcode, fromZoneKey, quantity, operator }) {
+        return await SheetSync._post({
+          action: 'thaw', barcode, fromLocation: locationCodeForZone(fromZoneKey || 'freezer'),
+          quantity, operator: operator || '관리자'
+        });
+      },
+
+      // 소분: 원재료 → 소분용기. foodExpiryDate는 통 교체 주기와 무관하게 별도로 전달.
+      async subdivide({ barcode, quantity, foodExpiryDate, operator }) {
+        return await SheetSync._post({
+          action: 'subdivide', barcode, quantity, foodExpiryDate, operator: operator || '관리자'
+        });
+      },
+
+      // 사용(소진)
+      async use({ barcode, quantity, operator }) {
+        return await SheetSync._post({ action: 'use', barcode, quantity, operator: operator || '관리자' });
+      },
+
+      // 폐기 (reason: 'expiry' | 'container' | 'safe')
+      async discard({ barcode, reason, quantity, operator }) {
+        return await SheetSync._post({ action: 'discard', barcode, reason, quantity, operator: operator || '관리자' });
+      }
+    };
+
+    /* -----------------------------------------------------------------------
+       1-3. 대형냉동고(상) 입고 우선순위 처리 (dashboard_extension.js 통합)
+       FRZ_BIG_TOP은 입고 빈번 구역이므로, 이 구역으로의 입고는 다른 구역
+       입고보다 항상 먼저 처리/표시되어야 한다. handleReceiveScan()에서
+       openQuickReceiveModal()을 부르기 직전에 아래 헬퍼로 큐를 정렬한다
+       (여러 건이 동시에 대기 중인 경우를 대비).
+       ----------------------------------------------------------------------- */
+    const receiveQueue = [];
+    function enqueueReceive(product) {
+      receiveQueue.push(product);
+      receiveQueue.sort((a, b) => {
+        const aPriority = LOCATION_ALERT_RULES[locationCodeForZone(a.zone)]?.receivePriority ? 0 : 1;
+        const bPriority = LOCATION_ALERT_RULES[locationCodeForZone(b.zone)]?.receivePriority ? 0 : 1;
+        return aPriority - bPriority; // FRZ_BIG_TOP(대형냉동-상) 품목이 먼저 오도록
+      });
+    }
+    function nextReceiveFromQueue() { return receiveQueue.shift(); }
+
+    /* -----------------------------------------------------------------------
+       1-4. 통합 알림 조회 (백엔드 GET ?action=alerts) (dashboard_extension.js 통합)
+       안전보관일(위치별 임박 기준) + 소분통 교체 + 식품 소비기한을 한 번에
+       가져와 홈 화면 배지("오늘 폐기 예정" 등) 카운트에 반영할 때 사용.
+       ----------------------------------------------------------------------- */
+    async function fetchPriorityAlerts() {
+      const r = await SheetSync._get({ action: 'alerts' });
+      return (r && r.success) ? r.data : [];
+    }
 
     // ---- 저장소 어댑터: 지금은 localStorage, 나중에 Firebase로 교체 시 이 객체만 수정 ----
     const Repo = {
@@ -870,6 +1102,70 @@
 
     let DB = { products: [], entries: {}, barcodeSeq: 0 };
 
+    // ---------------------------------------------------------
+    // 시트 헤더 ↔ 앱 내부 필드 매핑
+    //
+    // MASTER_PRODUCTS: barcode | productName | category | storage | ruleType | days
+    //   ruleType: '해동일'|'개봉일'|'소분일' (그 외/공백 = 원팩·소비기한만 관리)
+    //   days    : 안전보관일 숫자(일 단위만 지원 — 시간 단위는 시트에 없음)
+    //
+    // INVENTORY: barcode | productName | category | quantity | expiry | status | baseDate | safeUntil
+    //   status  : '정상' | '해동중' | '개봉' | '소진'
+    //   → 바코드당 1행(로트 여러 개 아님) 구조.
+    // ---------------------------------------------------------
+    const RULE_TYPE_TO_BASIS = { '해동일': 'thaw', '개봉일': 'open', '소분일': 'subdiv' };
+    const BASIS_TO_RULE_TYPE = { thaw: '해동일', open: '개봉일', subdiv: '소분일', openOnly: '개봉일', expiryOnly: '' };
+    function ruleTypeToBasis(ruleType) { return RULE_TYPE_TO_BASIS[ruleType] || 'expiryOnly'; }
+    function basisToRuleType(basis) { return BASIS_TO_RULE_TYPE[basis] || ''; }
+
+    // storage(냉동/냉장/상온) 값만으로는 좌/우 냉장 등 세부 zone까지 알 수 없으므로,
+    // 기존에 로컬에 이미 배치돼 있던 zone은 그대로 유지하고, 신규 품목만 기본 zone에 배정한다.
+    function defaultZoneForStorage(storage) {
+      if (storage === '냉동') return 'freezer';
+      if (storage === '상온') return 'room';
+      return 'left'; // 냉장 기본값
+    }
+
+    // 서버 MASTER_PRODUCTS 행 배열을 로컬 DB.products로 변환.
+    // 이미 로컬에 같은 바코드 품목이 있으면 zone/order/stockTracking 등 로컬 전용 값은 보존한다.
+    function mapMasterProducts(rows, prevProducts) {
+      return rows.map((row, idx) => {
+        const prev = prevProducts.find(p => p.barcode && normalizeGtin(p.barcode) === normalizeGtin(row.barcode));
+        return {
+          id: prev?.id || row.barcode || uid(),
+          barcode: row.barcode,
+          name: row.productName || prev?.name || '',
+          category: row.category || prev?.category || '기타',
+          storageMethod: row.storage || prev?.storageMethod || null,
+          basis: ruleTypeToBasis(row.ruleType),
+          durationValue: Number(row.days) || 0,
+          durationUnit: 'day',
+          containerCycleDays: row.containerCycleDays || prev?.containerCycleDays || DEFAULT_CONTAINER_CYCLE_DAYS,
+          zone: prev?.zone || defaultZoneForStorage(row.storage),
+          order: prev?.order ?? idx,
+          stockTracking: prev?.stockTracking || false,
+          defaultExpiry: prev?.defaultExpiry || null
+        };
+      });
+    }
+
+    // 서버 INVENTORY 행(바코드당 1행) 배열 → 클라이언트 DB.entries로 변환.
+    function mapInventoryToEntries(rows, products) {
+      const entries = {};
+      rows.forEach(row => {
+        const product = products.find(p => p.barcode && normalizeGtin(p.barcode) === normalizeGtin(row.barcode));
+        if (!product) return;
+        entries[product.id] = {
+          qty: Number(row.quantity) || 0,
+          expiry: row.expiry || null,
+          status: row.status || '정상',
+          baseDate: row.baseDate || null,
+          safeUntil: row.safeUntil || null
+        };
+      });
+      return entries;
+    }
+
     async function loadDB() {
       DB = await Repo.load();
       window.DB = DB;
@@ -878,21 +1174,15 @@
       // (여러 사람이 여러 기기에서 쓰는 경우를 감안해 시트 값을 우선한다)
       SheetSync.init();
       if (SheetSync.url) {
-        const remote = await SheetSync.pullAll();
-        if (remote) {
-          if (Array.isArray(remote.products) && remote.products.length) {
-            DB.products = remote.products.map(p => ({
-              ...p,
-              durationValue: Number(p.durationValue) || 0,
-              stockTracking: p.stockTracking === true || p.stockTracking === 'TRUE' || p.stockTracking === 'true',
-              order: Number(p.order) || 0
-            }));
-          }
-          if (remote.entries && typeof remote.entries === 'object') {
-            DB.entries = remote.entries;
-          }
-          await Repo.save(DB);
+        const products = await SheetSync.getProducts();
+        if (Array.isArray(products) && products.length) {
+          DB.products = mapMasterProducts(products, DB.products);
         }
+        const inventory = await SheetSync.getInventory();
+        if (Array.isArray(inventory)) {
+          DB.entries = mapInventoryToEntries(inventory, DB.products);
+        }
+        await Repo.save(DB);
       }
 
       // 기존에 저장된 데이터 중 바코드가 없는 품목이 있으면 자동으로 코드를 발급해 채워준다
@@ -923,14 +1213,38 @@
       window.DB = DB;
       await Repo.save(DB);
       const entry = DB.entries[productId];
-      if (entry) {
-        SheetSync.saveEntry({ productId, ...entry }); // 결과를 기다리지 않고 백그라운드로 동기화
+      const product = DB.products.find(p => p.id === productId);
+      if (entry && product) {
+        // INVENTORY 시트는 바코드당 1행이므로, 로컬에서 로트(lots)를 여러 개 쓰는 품목은
+        // 합계 수량 + 가장 가까운 소비기한으로 뭉쳐서 동기화한다.
+        let syncQty = entry.qty ?? 0;
+        let syncExpiry = entry.expiry || null;
+        if (Array.isArray(entry.lots) && entry.lots.length) {
+          syncQty = entry.lots.reduce((sum, l) => sum + (Number(l.qty) || 0), 0);
+          const withExpiry = entry.lots.filter(l => l.expiry).sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
+          syncExpiry = withExpiry[0]?.expiry || syncExpiry;
+        }
+        // 결과를 기다리지 않고 백그라운드로 재고 동기화 (INVENTORY 시트 헤더와 1:1 매핑)
+        SheetSync.saveInventory({
+          barcode: product.barcode,
+          productName: product.name,
+          category: product.category,
+          quantity: syncQty,
+          expiry: syncExpiry,
+          status: entry.status || '정상',
+          baseDate: entry.baseDate || null,
+          safeUntil: entry.safeUntil || computeSafeDate(product, entry) || null,
+          containerDue: computeContainerDue(product, entry) || null
+        });
       }
     }
     async function persistProducts() {
       window.DB = DB;
       await Repo.save(DB);
-      SheetSync.saveProducts(DB.products);
+      // 제품 기준 자체(MASTER_PRODUCTS 시트) 수정은 서버 쪽에 별도 저장 라우트가 필요합니다.
+      // 지금 API 스펙(products/scan/inventory/qc/qcLog/receive/move/thaw/subdivide/use/discard)에는
+      // 제품 기준 저장 액션으로 'saveProducts'가 추가돼 있습니다 — 필요 시 아래처럼 호출하세요:
+      //   SheetSync._post({ action: 'saveProducts', barcode, productName, category, storage, ruleType, days, containerCycleDays });
     }
 
     function uid() {
@@ -1065,14 +1379,21 @@
       return new Date(base.getTime() + ms).toISOString().slice(0, 16);
     }
 
-    // 안전보관일 상태(정상/임박/위험) 판정용
-    function safeStatus(safeDateStr) {
+    /* ---------------------------------------------------------------------
+       안전보관일 상태(정상/임박/위험) 판정용 (dashboard_extension.js 통합 — 교체됨)
+       기존 함수는 24시간 고정 임박 기준이었다. 냉장(우)=FRG_R_THAW는 해동/소분이
+       집중되는 구역이라 "2일(48h) 임박 시 적색 강조"가 필요하므로, zoneKey를
+       받아 위치별 warnHours를 적용하도록 확장한다. zoneKey를 생략하면 기존과
+       동일하게 24h 기준(ROOM_TEMP 규칙)으로 동작한다.
+       --------------------------------------------------------------------- */
+    function safeStatus(safeDateStr, zoneKey) {
       if (!safeDateStr) return 'none';
       const safe = new Date(safeDateStr);
       const now = new Date();
       const diffH = (safe - now) / 3600000;
+      const rule = LOCATION_ALERT_RULES[locationCodeForZone(zoneKey)] || { warnHours: 24 };
       if (diffH <= 0) return 'danger';
-      if (diffH <= 24) return 'warn';
+      if (diffH <= rule.warnHours) return rule.priorityAlert ? 'priority-danger' : 'warn';
       return 'ok';
     }
 
@@ -1088,12 +1409,40 @@
       return 'ok';
     }
 
+    // priority-danger 상태도 danger 계열 배지 CSS 클래스로 매핑하기 위한 헬퍼
+    // (renderDualRuleBadges 등에서 safeStatus의 4가지 반환값을 실제 .safe-pill 클래스로 변환)
+    function pillClassFor(status) {
+      if (status === 'priority-danger') return 'priority-danger';
+      if (status === 'danger') return 'danger';
+      if (status === 'warn') return 'warn';
+      if (status === 'ok') return 'ok';
+      return '';
+    }
+
+    // 소분 품목용 상태 배지 2개(통 교체 / 식품 소비기한)를 함께 렌더링하는 헬퍼.
+    // renderProductList()에서 basis === 'subdiv'이고 재고관리(stockTracking) 대상이
+    // 아닌 품목의 배지 렌더링에 사용한다.
+    function renderDualRuleBadges(product, entry) {
+      const containerDue = computeContainerDue(product, entry);
+      const foodExpiry = foodExpiryOf(product, entry);
+      const containerStatus = containerDue ? safeStatus(containerDue, product.zone) : 'none';
+      const expiryStatusVal = foodExpiry ? expiryStatus(foodExpiry) : 'none';
+      return `
+        <span class="safe-pill ${pillClassFor(containerStatus)}" title="소분통 교체(${product.containerCycleDays || DEFAULT_CONTAINER_CYCLE_DAYS}일 고정)">
+          🧴 통교체 ${containerDue ? fmtDT(containerDue) : '미입력'}
+        </span>
+        <span class="safe-pill ${pillClassFor(expiryStatusVal)}" title="식품 자체 소비기한">
+          🥫 식품기한 ${foodExpiry ? fmtD(foodExpiry) : '미입력'}
+        </span>
+      `;
+    }
+
     /* =========================================================
        3. 완성형 한글(CP949) 인코딩 — SRP-350III 출력용
        TextEncoder는 UTF-8만 지원하여 한글이 깨지므로,
        U+AC00~U+D7A3(가~힣) 11,172자를 CP949 2바이트로 변환하는 테이블을 사용한다.
        ========================================================= */
-    const HANGUL_CP949_B64 = "sKGwooFBgUKwo4FDgUSwpLClsKawp4FFgUaBR4FIgUmwqLCpsKqwq7CssK2wrrCvgUqwsLCxsLKws7C0gUuBTLC1gU2BToFPsLaBUIFRgVKBU4FUgVWBVrC3sLiBV7C5sLqwu4FYgVmBWoFhgWKBY7C8sL2BZIFlsL6BZoFngWiwv4FpgWqBa4FsgW2BboFvgXCBcYFysMCBc7DBgXSBdYF2gXeBeIF5sMKBeoGBgYKww4GDgYSBhbDEgYaBh4GIgYmBioGLgYyBjYGOgY+BkIGRgZKBk4GUgZWBloGXgZiwxbDGgZmBmrDHgZuBnLDIsMmBnbDKgZ6Bn4GggaGBorDLsMyBo7DNsM6wz7DQgaSBpbDRsNKw07DUgaaBp4GosNWBqYGqgauw1oGsga2BroGvgbCBsYGysNew2IGzsNmw2rDbgbSBtYG2gbeBuIG5sNyw3bDegbqw34G7gbyw4LDhgb2BvoG/gcCBwYHCgcOw4rDjgcSw5LDlsOaBxYHGgcew54HIgcmw6IHKgcuBzLDpgc2BzoHPsOqB0IHRgdKB04HUgdWB1oHXsOuB2LDsgdmB2oHbgdyB3YHegd+B4LDtsO6B4YHisO+B44HksPCw8YHlsPKB5rDzgeeB6LD0sPWw9oHpsPeB6rD4sPmB64Hsge2B7oHvsPqw+4HwgfGw/IHygfOB9LD9gfWw/oH2gfeB+IH5gfqxobGigfuxo4H8saSB/YH+gkGCQoJDgkSxpYJFgkaCR7GmgkiCSYJKsaeCS4JMgk2CToJPglCCUYJSsaiCU4JUsamxqoJVglaCV4JYglmCWrGrsayCYYJisa2CY4JkgmWxroJmgmeCaIJpgmqCa4Jssa+xsIJtsbGCbrGygm+CcIJxgnKCc4J0sbOCdYJ2gnextIJ4gnmCerG1goGCgoKDgoSChYKGgoeCiLG2gomxt4KKgouCjIKNgo6Cj4KQgpGxuLG5gpKCk7G6gpSClbG7sbyxvbG+gpaCl4KYgpmxv7HAscGCmrHCgpuxw7HEgpyCnYKegp+CoLHFscaCoYKisceCo4KkgqWxyIKmgqeCqIKpgqqCq4Ksgq2CroKvgrCxybHKgrGCsoKzgrSCtYK2scuCt4K4grmCuoK7gryCvYK+gr+CwILBgsKCw4LEgsWCxoLHgsixzILJgsqCy4LMgs2CzoLPgtCxzbHOgtGC0rHPgtOC1ILVsdCC1oLXgtiC2YLagtuC3LHRsdKC3bHTgt6C34LgguGC4oLjguSC5bHUguaC54LosdWC6YLqguux1oLsgu2C7oLvgvCC8YLygvOC9IL1gvaC94L4gvmC+oL7gvyC/YL+sdex2INBg0Kx2YNDg0Sx2rHbsdyDRYNGg0eDSINJg0qx3bHeg0ux34NMseCDTYNOg0+DUINRg1Kx4YNTg1SDVYNWg1eDWINZg1qDYYNig2ODZINlg2aDZ4Nog2mDaoNrg2yDbYNug2+DcINxg3KDc7HiseODdIN1seSDdoN3seWx5oN4seeDeYN6g4GDgoODseix6YOEseqDhbHrseyDhoOHg4ix7YOJse6x77Hwg4qx8YOLg4yDjbHyg46x84OPg5CDkYOSg5Ox9LH1g5Sx9rH3sfiDlYOWg5ex+YOYg5mx+rH7g5qDm7H8g5yDnYOesf2Dn4Ogg6GDooOjg6SDpbH+sqGDprKisqOypIOng6iDqYOqg6uDrLKlsqaDrYOug6+DsIOxg7Kyp4Ozg7SDtYO2g7eDuIO5g7qDu4O8g72DvoO/g8CDwYPCg8ODxIPFg8aDx4PIg8mDyoPLg8yDzYPOg8+D0IPRg9KD04PUg9WD1oPXg9iD2YPag9uD3IPdg96D34Pgg+GyqLKpsqqD4rKrg+OD5IPlsqyD5oPng+iD6YPqg+uD7LKtsq6D7bKvsrCysYPug++D8IPxg/KD87KysrOD9IP1srSD9oP3g/iD+YP6g/uD/IP9g/6EQYRCsrWEQ4REsraERbK3hEaER4RIhEmESoRLsriETIRNhE6yuYRPhFCEUbK6hFKEU4RUhFWEVoRXhFiEWYRahGGyu7K8hGKEY4RkhGWyvYRmhGeyvoRohGmEaoRrhGyEbYRuhG+EcIRxhHKEc4R0hHWEdoR3hHiEeYR6hIGEgoSDhISEhYSGhIeEiLK/ssCEiYSKssGEi7LChIyyw4SNhI6Ej4SQhJGEkoSTssSyxYSUssaElbLHssiyyYSWhJeEmISZssqyy4SahJuEnISdhJ6En7LMhKCEoYSihKOEpISlhKaEp4SohKmEqrLNss6Eq4SshK2EroSvhLCyz7LQhLGEsoSzhLSEtYS2hLeEuIS5hLqEu4S8hL2EvoS/hMCEwYTChMOy0YTEhMWExoTHhMiEybLShMqEy4TMstOEzYTOhM+y1ITQhNGE0oTThNSE1YTWstWy1oTXhNiE2bLXhNqE24TchN2E3oTfstiE4IThhOKE44TkhOWE5oTnhOiE6YTqhOuE7ITthO6E74TwhPGE8oTzhPSE9YT2hPeE+IT5hPqy2bLahPuE/LLbhP2E/oVBstyFQoVDhUSFRYVGhUey3bLest+FSLLghUmy4bLihUqFS4VMhU2FTrLjhU+FUIVRhVKFU4VUhVWy5IVWhVeFWIVZhVqFYYVihWOFZIVlhWay5bLmhWeFaIVphWqFa4Vssuey6IVthW6y6YVvhXCFcbLqhXKFc4V0hXWFdoV3hXiy67LshXmFerLthYGFgoWDhYSFhYWGhYey7oWIhYmFirLvhYuFjIWNsvCFjoWPhZCFkYWShZOFlLLxsvKFlYWWhZeFmIWZhZqFm4WchZ2FnrLzhZ+FoIWhhaKFo4WkhaWFpoWnhaiFqYWqhauFrIWtha6Fr4WwhbGFsoWzhbSFtYW2hbeFuIW5svSy9YW6hbuy9oW8sveFvbL4hb6y+YW/hcCFwYXCsvqy+7L8hcOy/YXEsv6FxYXGhcezoYXIhcmFyoXLhcyFzYXOhc+F0IXRhdKF04XUhdWF1oXXhdiF2YXahduF3IXdhd6F34XgheGF4oXjheSF5bOis6OF5oXns6SF6IXpheqzpYXrheyF7YXuhe+F8IXxs6azp4Xys6iF87OphfSF9YX2hfeF+IX5s6qzq7OshfqzrYX7hfyzrrOvs7CzsYX9hf6GQYZChkOzsrOzhkSztLO1s7azt7O4hkWzuYZGs7qzu7O8hkeGSLO9hkmGSoZLs76GTIZNhk6GT4ZQhlGGUrO/s8CGU7PBs8Kzw4ZUhlWGVoZXhliGWbPEs8WGWoZhs8aGYoZjhmSzx4ZlhmaGZ4ZohmmGaoZrs8iGbIZthm6Gb7PJhnCGcYZyhnOGdIZ1hnaGd4Z4hnmGeoaBhoKGg4aEhoWGhoaHhoiGiYaKhouGjIaNho6Gj4aQhpGGkoaThpSGlYaWhpezyrPLhpizzLPNhpmGmoabs86GnLPPs9CGnYaehp+GoLPRs9KGobPTs9Sz1YaihqOGpIalhqaz1rPXs9iGp4aos9mGqYaqhquz2oashq2GroavhrCGsYays9uz3Iazs92z3rPfhrSGtYa2hreGuIa5s+Cz4Ya6hruz4oa8hr2GvrPjhr+GwIbBhsKGw4bEhsWz5LPlhsaGx7Pms+eGyIbJs+iGyobLhsyz6YbNhs6Gz7PqhtCG0YbShtOG1IbVhtaG14bYhtmG2obbhtyG3Ybeht+G4IbhhuKG44bkhuWG5rPrs+yG54bos+2G6Ybqhuuz7obss++G7Ybuhu+G8Ibxs/Cz8Ybys/KG87PzhvSG9Yb2hvez9LP1s/aG+Ib5hvqz94b7hvyG/bP4hv6HQYdCh0OHRIdFh0aHR4dIh0mHSrP5h0uHTIdNh06HT4dQh1GHUodTh1SHVYdWh1eHWIdZh1qHYYdih2OHZIdlh2aHZ4doh2mHaodrh2yHbYduh2+HcIdxh3KHc7P6h3SHdYd2s/uHd4d4h3mz/Id6h4GHgoeDh4SHhYeGs/2z/oeHtKGHiIeJh4qHi4eMh42HjoePtKK0o4eQh5G0pIeSh5OHlLSlh5WHloeXh5iHmYeah5uHnLSmh520p4eetKiHn4egh6GHooejh6S0qbSqh6WHprSrh6eHqLSstK2HqYeqh6uHrIeth66Hr7SutK+HsLSwh7G0sYeyh7OHtIe1h7aHt7Syh7iHuYe6h7uHvIe9h76Hv4fAh8GHwofDh8SHxYfGh8eHyIfJh8q0s4fLh8yHzYfOh8+H0IfRtLSH0ofTh9SH1YfWh9eH2IfZh9qH24fch92H3offh+CH4Yfih+OH5Iflh+aH54foh+mH6ofrh+y0tYfth+6H77S2h/CH8YfytLeH84f0h/WH9of3h/iH+bS4tLmH+of7h/yH/Yf+iEGIQohDiESIRbS6tLuIRohHiEiISYhKiEu0vIhMiE2ITohPiFCIUYhStL20vohTiFSIVbS/iFaIV4hYiFmIWohhtMC0wYhiiGO0wohkiGWIZrTDtMS0xYhniGiIaYhqiGu0xrTHiGy0yIhttMm0yohuiG+IcLTLiHG0zIhyiHOIdLTNiHWIdoh3tM6IeIh5iHqIgYiCiIOIhIiFiIaIh4iIiImIioiLiIyIjYiOiI+IkLTPtNCIkYiStNGIk4iUiJW00oiWtNOIl4iYiJmImoibtNS01YictNaInbTXiJ6In4igiKG02IiitNm02rTbiKO03IikiKW03bTetN+04LThiKaIp4iotOK047TkiKm05bTmtOe06LTpiKqIq4istOq067TsiK2IrrTtiK+IsIixtO6IsoiziLSItYi2iLeIuLTvtPCIubTxtPK084i6iLuIvIi9iL6Iv7T0iMCIwYjCiMOIxIjFiMaIx4jIiMmIyojLiMyIzYjOiM+I0IjRiNKI04jUiNWI1ojXiNiI2YjaiNuI3IjdiN6I34jgiOGI4ojjiOSI5YjmiOeI6IjpiOqI64jsiO2I7ojviPCI8YjyiPOI9Ij1iPa09bT2tPeI97T4iPiI+bT5tPqI+rT7tPyI+4j8iP2I/rT9tP6JQbWhiUK1oolDtaOJRIlFtaSJRrWltaaJR4lItaeJSYlKiUu1qIlMiU2JTolPiVCJUYlStam1qolTtau1rLWtiVSJVYlWiVeJWIlZta6JWolhiWK1r4ljiWSJZbWwiWaJZ4loiWmJaolriWyJbYluiW+JcLWxtbKJcYlyiXOJdIl1iXa1s4l3iXiJebW0iXqJgYmCiYOJhImFiYaJh4mIiYmJiomLiYyJjYmOiY+JkImRiZKJk4mUiZWJlrW1tbaJl4mYtbeJmYmatbi1uYmbtbqJnLW7iZ2Jnomftby1vYmgtb6JobW/iaK1wImjtcGJpImltcKJpomniai1w4mpiaqJq7XEiayJrYmuia+JsImxibKJs4m0ibWJtom3ibiJuYm6ibuJvIm9ib61xYm/icCJwYnCicOJxInFicaJx4nIicmJyonLicyJzYnOic+J0InRtcaJ0onTidSJ1YnWideJ2LXHidmJ2onbtciJ3Indid61yYnfieCJ4YniieOJ5Inltcq1y4nmtcyJ54noiemJ6onrieyJ7Ynutc2J74nwifGJ8onzifSJ9Yn2ifeJ+In5ifqJ+4n8if2J/opBikKKQ4pEikWKRopHikiKSYpKiku1zrXPikyKTbXQik6KT4pQtdGKUYpSilOKVIpVilaKV7XStdOKWLXUilm11YpaimGKYopjimSKZbXWimaKZ4poimmKaoprimyKbYpuim+KcIpxinKKc4p0inWKdop3ini114p5inqKgYqCioOKhIqFtdiKhoqHioiKiYqKiouKjIqNio6Kj4qQipGKkoqTipSKlYqWipeKmIqZtdmKmoqbipyKnYqeip+12oqgiqGKorXbiqOKpIqltdyKpoqniqiKqYqqiquKrIqttd2KrrXeiq+134qwirGKsoqzirSKtbXgiraKt4q4teGKuYq6iru14oq8ir2Kvoq/isCKwYrCteOKw4rEisWKxrXkiseKyIrJisqKy4rMteW15orNis6154rPitC16LXpitG16orSitOK1IrVita167Xsite17YrYte6K2YraituK3Irdit6174rfiuCK4YriiuOK5IrliuaK54roiumK6orriuyK7Yruiu+K8IrxivKK84r0ivWK9or3iviK+bXwtfGK+or7tfKK/Ir9tfO19Ir+i0GLQotDi0SLRYtGtfW19otHtfe1+LX5tfqLSItJi0qLS4tMtfu1/ItNi061/YtPi1CLUbX+i1KLU4tUi1WLVotXi1i2obaii1m2o7aktqWLWothi2KLY4tktqa2p7aoi2WLZrapi2eLaItptqqLaotri2yLbYtui2+LcLartqyLcbattq62r4tyi3OLdIt1i3aLd4t4i3mLeouBi4KLg4uEi4WLhouHi4iLiYuKi4uLjIuNi46Lj4uQi5GLkouTi5SLlYuWi5eLmIuZi5qLm4uci52Lnoufi6CLoYuii6OLpIuli6aLp4uoi6mLqouri6yLrYuui6+LsIuxi7KLs4u0i7W2sLaxi7aLt7ayi7iLuYu6trOLu7a0trWLvIu9i76Lv7a2treLwLa4trm2uovBi8KLw4vEi8W2u7a8tr2LxovHtr6LyIvJi8q2v4vLi8yLzYvOi8+L0IvRtsC2wYvStsK2w7bEi9OL1IvVi9aL14vYtsWL2Yvai9uL3Ivdi96L34vgi+GL4ovji+SL5Yvmi+eL6Ivpi+qL67bGi+yL7Yvui++L8Ivxi/KL84v0i/WL9ov3i/iL+Yv6i/uL/Iv9i/6MQYxCjEOMRIxFjEaMR4xIjEmMSoxLjEyMTYxOjE+MULbHtsiMUYxStsmMU4xUjFW2yoxWjFeMWIxZjFqMYYxijGOMZIxljGaMZ7bLjGiMaYxqjGuMbIxttsyMboxvjHCMcYxyjHOMdLbNjHWMdox3jHiMeYx6jIGMgoyDjISMhYyGjIeMiIyJjIqMi4yMjI22zoyOjI+MkIyRjJKMk4yUjJWMloyXjJiMmYyajJuMnIydjJ6Mn4ygjKGMooyjjKSMpYymjKeMqLbPjKmMqoyrttCMrIytjK6Mr4ywjLGMsoyzjLSMtYy2jLeMuIy5jLqMu4y8jL2Mvoy/jMCMwYzCjMOMxIzFjMaMx4zIjMmMyozLjMyMzYzOjM+M0IzRjNKM04zUjNWM1ozXjNiM2YzajNuM3IzdjN620bbSjN+M4LbTjOGM4ozjttSM5IzljOaM54zojOm21bbWjOqM64zsjO2214zujO+M8IzxjPKM84z0jPWM9oz3jPiM+Yz6jPuM/Iz9jP6NQY1CjUONRI1FjUaNR41IjUmNSo1LjUyNTY1OjU+NUI1RttiNUo1TjVSNVY1WjVeNWI1ZjVqNYY1ijWONZI1ljWaNZ41ojWmNao1rjWyNbY1ujW+NcI1xjXK22Y1zjXSNdbbajXaNd414ttuNeY16jYGNgo2DjYSNhbbctt2Nho2HjYi23o2JjYqNi42MjY2Njo2PjZCNkY2SjZONlI2VjZaNl42YjZmNmo2bjZyNnY2ejZ+NoI2hjaKNo42kjaWNpo2njaiNqY2qtt+24I2rjay24Y2tja624rbjja+NsI2xjbKNs420jbW25Lbljba25o23jbiNuY26jbuNvI29jb62542/jcCNwbbojcKNw43EtumNxY3GjceNyI3JjcqNy7bqtuuNzI3Njc6Nz43QjdGN0o3TjdSN1bbsjdaN143Ytu2N2Y3ajdu27o3cjd2N3o3fjeCN4Y3itu+28I3jtvGN5LbyjeWN5o3njeiN6Y3qtvO29I3rjey29Y3tje6N77b2jfCN8Y3yjfON9I31jfa297b4jfe2+bb6tvu2/I34jfmN+rb9tv63obeijfuN/Lejjf2N/o5Bt6SOQo5DjkSORY5GjkeOSLelt6aOSbent6i3qY5KjkuOTI5Njk6OT7eqt6uOUI5Rt6yOUo5TjlSOVY5WjleOWI5ZjlqOYY5ijmOOZI5lt62OZreujmeOaI5pjmqOa45sjm2Obo5vjnCOcY5yjnOOdI51jnaOd454jnmOeo6BjoKOg46EjoWOho6HjoiOiY6KjouOjI6Njo63r7ewjo+OkLexjpGOko6Tt7KOlI6VjpaOl46YjpmOmrezt7SOm7e1t7a3t46cjp2Ono6fjqC3uLe5t7qOoY6it7uOo46kjqW3vI6mjqeOqI6pjqqOq46st723vo6tt7+OrrfAjq+OsI6xjrKOs460t8G3wo61jra3w463jriOubfEjrqOu468jr2Ovo6/jsC3xbfGjsG3x7fIt8mOwo7DjsSOxY7Gjse3yo7IjsmOyrfLjsuOzI7Njs6Oz47QjtGO0o7TjtSO1Y7Wt8yO17fNjtiO2Y7ajtuO3I7djt6O37fOt8+O4I7ht9CO4o7jjuS30Y7ljuaO547ojumO6o7rt9K3047st9SO7bfVju6O747wjvGO8o7zt9aO9I71jva31473jviO+Y76jvuO/I79jv6PQY9Cj0OPRI9Fj0aPR49It9iPSY9Kj0uPTI9Nj06PT49Qj1GPUo9Tj1SPVY9Wj1ePWI9Zj1qPYY9ij2OPZI9lj2aPZ49ot9mPaY9qj2uPbI9tj26Pb7faj3CPcY9yt9uPc490j3W33I92j3ePeI95j3qPgY+Ct9233o+Dt9+PhLfgj4WPho+Hj4iPiY+Kt+GPi4+Mj4234o+Oj4+PkLfjj5GPko+Tj5SPlY+Wj5ePmLfkj5m35Y+at+aPm4+cj52Pno+fj6C357foj6GPorfpj6OPpI+lt+qPpo+nj6iPqY+qj6uPrLfrt+yPrbftj6637o+vj7CPsY+yj7OPtLfvj7WPto+3j7iPuY+6j7uPvI+9j76Pv4/Aj8GPwo/Dj8SPxY/Gj8e38I/Ij8mPyo/Lj8yPzY/Ot/GPz4/Qj9GP0o/Tj9SP1Y/Wj9eP2I/Zj9qP24/cj92P3o/fj+CP4Y/ij+OP5I/lj+aP54/oj+m38rfzj+qP67f0j+yP7Y/ut/WP74/wj/GP8o/zj/SP9bf2j/aP97f3j/i3+I/5j/qP+4/8j/2P/rf5t/qQQZBCt/uQQ5BEkEW3/JBGkEeQSJBJkEqQS5BMt/23/pBNuKGQTriikE+QUJBRkFKQU5BUuKO4pJBVkFa4pZBXkFiQWbimkFqQYZBikGOQZJBlkGa4p7iokGe4qZBouKq4q5BpkGq4rLitkGuQbJBtkG6Qb5BwkHGQcpBzkHSQdZB2kHeQeJB5kHqQgZCCkIOQhJCFkIaQh5CIkImQipCLkIyQjbiuuK+QjpCPuLCQkJCRkJK4sZCTkJSQlZCWkJeQmJCZuLK4s5CauLSQm7i1kJyQnZCekJ+QoJChuLa4t5CikKO4uJCkuLm4uri7uLy4vZClkKaQp5CokKm4vri/kKq4wJCruMG4wpCskK24w5CuuMS4xbjGkK+QsLjHkLGQspCzuMiQtJC1kLaQt5C4kLmQurjJuMqQu7jLuMy4zbjOkLyQvZC+kL+QwLjPuNCQwZDCkMOQxJDFkMa40ZDHkMiQyZDKkMuQzJDNkM6Qz5DQkNGQ0rjSkNOQ1JDVkNaQ15DYkNmQ2pDbkNyQ3ZDekN+Q4JDhkOKQ45DkkOWQ5pDnkOiQ6ZDqkOuQ7JDtkO6Q75DwkPGQ8pDzkPS407jUkPWQ9rjVkPeQ+JD5uNaQ+rjXkPuQ/JD9kP6RQbjYuNmRQrjakUO427jckUSRRZFGkUe43bjeuN+RSJFJuOCRSpFLkUy44ZFNkU6RT5FQkVGRUpFTuOK445FUuOS45bjmkVWRVpFXkViRWZFauOe46JFhkWK46ZFjkWSRZbjqkWaRZ5FokWmRapFrkWyRbZFukW+467jsuO2RcLjukXGRcpFzkXS475F1kXaRd5F4kXmRepGBkYKRg5GEkYWRhpGHkYiRiZGKkYuRjJGNkY6Rj5GQkZGRkpGTkZSRlbjwuPGRlrjyuPORl5GYkZm49JGauPWRm5GckZ2RnpGfuPa495GguPiRobj5kaKRo5GkkaWRppGnuPqRqJGpkaq4+5GrkayRrZGuka+RsJGxkbKRs5G0kbWRtpG3kbiRubj8uP2RupG7kbyRvZG+kb+RwJHBkcKRw5HEkcWRxpHHkciRyZHKkcuRzJHNkc6Rz5HQkdGR0pHTkdSR1ZHWkdeR2JHZkdqR27j+kdyR3ZHeuaGR35HgkeG5opHikeOR5JHlkeaR55Hokem5o5HquaSR67mlkeyR7ZHuke+R8JHxuaaR8pHzkfS5p5H1kfaR97mokfiR+ZH6kfuR/JH9kf6SQbmpkkK5qpJDkkSSRZJGkkeSSJJJkkq5q7msua2SS7mukkySTbmvubC5sbmykk6ST5JQklGSUrmzubSSU7m1klS5tpJVklaSV7m3kli5uLm5klmSWpJhubqSYpJjkmS5u5JlkmaSZ5JokmmSapJrkmy5vJJtub2SbpJvknCScZJyknOSdJJ1ub6SdpJ3kniSeZJ6koGSgpKDkoSShZKGkoeSiJKJkoqSi5KMko2SjpKPkpCSkZKSkpOSlJKVkpa5v5KXkpiSmbnAkpqSm5KcucGSnZKekp+SoJKhkqKSo5KkkqWSppKnkqiSqZKqkquSrJKtkq6Sr7nCkrCSsZKyucOSs5K0krW5xJK2kreSuJK5krqSu5K8ucWSvZK+ucaSv5LAksGSwpLDksSSxZLGuceSx5LIksm5yJLKksuSzLnJks2SzpLPktCS0ZLSktO5ypLUktW5y5LWkteS2JLZktqS25Lckt2S3pLfkuCS4ZLikuOS5JLlkuaS55LokumS6pLrkuyS7ZLuku+S8JLxkvKS85L0kvWS9pL3kviS+bnMuc2S+pL7uc6S/JL9uc+50JL+udGTQZNCk0OTRJNFudK505NGudS51bnWk0e515NIudiTSZNKudm52rnbudy53ZNLk0y53rnfueC54bnik02TTpNPk1C547nkk1G55ZNSueaTU5NUk1W555NWk1e56Lnpk1iTWbnqk1qTYZNiueuTY5Nkk2WTZpNnk2iTabnsue2Tarnuue+58JNrk2yTbbnxk26Tb7nyufOTcJNxufSTcpNzk3STdZN2k3eTeJN5k3qTgZOCk4O59ZOEk4WThpOHk4iTiZOKk4uTjJONk46Tj5OQk5GTkpOTk5STlZOWk5eTmJOZk5qTm5Ock52TnpOfk6CToZOik6OTpJOlk6aTp5Ook6m59rn3k6qTq7n4k6yTrbn5ufqTrrn7k6+TsJOxk7KTs7n8uf2TtLn+k7W6obqik7aTt5O4k7mTurqjuqSTu5O8uqWTvZO+uqa6p5O/k8CTwZPCk8OTxJPFuqi6qZPGuqq6q7qsk8eTyJPJk8qTy5PMuq26rpPNk866r5PPk9CT0bqwk9KT05PUk9WT1pPXk9iT2bqxk9q6srqzurST25Pck926tZPek9+6tpPgk+GT4rq3k+OT5JPlk+aT55Pok+mT6pPrk+yT7ZPuk++T8JPxk/KT85P0k/WT9pP3k/iT+bq4urm6upP6uruT+5P8k/26vJP+lEGUQpRDlESURZRGur26vpRHur+USLrAlEmUSpRLlEyUTZROusGUT5RQlFG6wpRSlFOUVJRVlFaUV5RYlFmUWpRhlGKUY5RklGWUZrrDlGeUaJRplGqUa5RslG26xJRulG+UcJRxlHKUc5R0lHWUdpR3lHiUeZR6lIGUgpSDlISUhZSGusWUh5SIlImUipSLlIyUjbrGuseUjpSPusiUkJSRlJK6yZSTlJSUlZSWlJeUmJSZusq6y5SalJuUnJSdlJ6Un5SglKGUopSjusyUpJSllKa6zZSnlKiUqZSqlKuUrJStlK6Ur5SwlLGUspSzlLSUtZS2lLeUuJS5lLqUu5S8lL26zrrPlL6Uv7rQlMCUwbrRutK607rUlMKUw5TElMWUxrrVutaUx7rXlMi62JTJlMqUy7rZutqUzLrblM2UzpTPlNCU0ZTSlNO63JTUlNWU1pTXlNiU2ZTalNuU3JTdlN663ZTflOCU4ZTilOOU5JTlut6U5pTnlOiU6ZTqlOuU7JTtlO6U75TwlPGU8pTzlPSU9ZT2lPeU+JT5lPqU+5T8lP2U/pVBlUK637rglUOVRLrhlUWVRpVHuuKVSJVJlUqVS5VMlU2VTpVPlVCVUZVSlVO645VUlVWVVpVXlViVWbrklVqVYZViuuWVY5VklWW65pVmlWeVaJVplWqVa5VsuueVbZVuuuiVb7rplXCVcZVylXOVdJV1uuq665V2lXe67JV4lXmVerrtlYGVgpWDlYSVhZWGlYe67rrvlYi68JWJlYqVi5WMlY2VjpWPlZCVkZWSlZOVlJWVlZaVl5WYlZmVmpWblZyVnZWelZ+VoJWhlaKVo5WklaWVppWnlaiVqZWqlauVrLrxuvKVrZWuuvOVr5WwlbG69JWyuvWVs5W0lbWVtpW3uva695W4uviVubr5uvq6+5W6lbuVvJW9uvy6/ZW+lb+6/pXAlcGVwruhlcO7opXElcWVxpXHlci7o7uklcm7pbumu6eVypXLlcyVzZXOu6i7qbuqlc+V0LurldGV0pXTu6yV1JXVldaV15XYldmV2rutu66V27uvu7C7sZXcld2V3pXfleCV4buyu7OV4pXjleSV5ZXmleeV6JXpleqV65Xsle2V7pXvu7SV8JXxlfKV85X0lfWV9pX3lfiV+ZX6lfuV/JX9lf6WQZZClkOWRJZFlkaWR5ZIlkmWSpZLlkyWTZZOlk+WUJZRllKWU5ZUllWWVpZXlli7tbu2llmWWru3lmGWYru4u7mWY5ZklmWWZpZnlmiWabu6lmqWa7u7u7y7vZZslm2WbpZvlnCWcbu+lnKWc5Z0lnWWdpZ3lniWeZZ6loGWgpaDloSWhZaGloeWiJaJloqWi7u/loyWjZaOlo+WkJaRu8C7wZaSlpOWlJaVlpaWl5aYlpmWmpablpyWnZaelp+7wrvDlqC7xLvFu8aWoZailqOWpJallqaWp5aolqmWqparlqyWrZaulq+WsJaxlrKWs5a0lrWWtpa3lriWuZa6lruWvJa9lr6Wv5bAlsGWwrvHu8iWw5bEu8mWxZbGlse7ypbIlsmWypbLlsyWzZbOu8u7zJbPltCW0bvNltKW05bUltWW1pbXltiW2ZbaltuW3Jbdlt6W35bgluGW4pbjluSW5ZbmlueW6JbpluqW65bslu2W7pbvlvCW8ZbylvOW9Jb1lvaW95b4lvmW+pb7lvyW/Zb+l0GXQpdDl0SXRZdGl0eXSJdJl0qXS5dMl02XTpdPl1CXUbvOl1KXU5dUl1WXVpdXl1iXWZdal2GXYpdjl2SXZZdml2eXaJdpl2qXa5dsl22Xbpdvl3CXcZdyu8+Xc5d0l3WXdpd3l3iXeZd6l4GXgpeDl4SXhZeGl4eXiJeJl4qXi5eMu9CXjZeOl4+XkJeRl5K70bvSl5OXlLvTl5WXlpeXu9SXmJeZl5qXm5ecl52XnrvVl5+XoLvWl6G715eil6OXpJell6aXp5eol6mXqperl6yXrZeul6+XsJexl7KXs5e0l7WXtpe3l7iXuZe6l7uXvJe9l76Xv5fAl8GXwpfDl8SXxZfGl8eXyJfJl8qXy5fMl82XzpfPl9CX0ZfSl9OX1JfVl9aX15fYl9mX2pfbl9yX3Zfel9+X4Jfhl+KX45fkl+WX5pfnl+iX6Zfql+uX7Jftl+6X75fwl/GX8pfzl/SX9Zf2l/eX+Jf5l/qX+7vYl/yX/Zf+mEGYQphDmESYRZhGmEeYSJhJmEqYS5hMmE2YTphPmFCYUbvZmFKYU5hUmFWYVphXu9qYWJhZmFq725hhmGKYY7vcmGSYZZhmmGeYaJhpmGq73bvemGuYbJhtmG6Yb5hwmHGYcphzmHSYdZh2mHeYeJh5mHqYgZiCmIOYhJiFmIaYh5iImImYipiLmIyYjZiOmI+YkJiRmJKYk5iUmJWYlrvfu+CYl5iYu+GYmZiamJu74picmJ2YnpifmKCYoZiiu+O75Jiju+WYpLvmmKWYppinmKiYqZiqu+e76Jiru+m76pismK2767vsu+277piumK+YsJixmLK777vwmLO78bvyu/OYtJi1mLa79Ji3mLi79bv2mLmYurv3mLuYvJi9u/iYvpi/mMCYwZjCmMOYxLv5u/qYxbv7u/y7/ZjGmMeYyJjJmMqYy7v+vKGYzJjNvKKYzpjPmNC8o5jRmNKY05jUmNWY1pjXvKS8pZjYvKaY2bynmNqY25jcmN2Y3pjfvKiY4JjhmOK8qZjjmOSY5byqmOaY55jomOmY6pjrmOy8q5jtmO6Y75jwvKyY8ZjymPOY9Jj1mPa8rbyuvK+8sLyxmPeY+LyyvLOY+by0vLWY+pj7mPyY/by2vLeY/ry4vLm8uplBmUKZQ5lEvLuZRby8vL2ZRplHvL6ZSJlJmUq8v5lLmUyZTZlOmU+ZUJlRvMC8wZlSvMK8w7zEmVOZVJlVmVaZV5lYvMW8xplZmVq8x5lhmWKZY7zImWSZZZlmmWeZaJlpmWq8ybzKmWu8y7zMvM2ZbJltmW6Zb5lwmXG8zplymXOZdLzPmXWZdpl3vNCZeJl5mXqZgZmCmYOZhJmFmYaZh5mImYm80ZmKmYuZjJmNmY6Zj7zSvNO81JmQvNWZkZmSmZO81pmUvNeZlZmWmZeZmJmZvNi82ZmavNqZm7zbmZyZnZmevNyZn5mgvN283pmhmaK835mjmaSZpbzgmaaZp5momamZqpmrmayZrZmuma+ZsJmxvOGZspmzmbSZtZm2mbe84pm4mbmZurzjmbuZvJm9vOSZvpm/mcCZwZnCmcOZxLzlmcWZxrzmvOeZx5nImcmZypnLmcyZzbzomc6Zz5nQvOmZ0ZnSmdO86pnUmdWZ1pnXmdiZ2ZnavOu87JnbvO2Z3Jndmd6Z35ngmeGZ4pnjvO6875nkmeW88JnmmeeZ6LzxmemZ6pnrmeyZ7Znume+88rzzmfC89JnxvPWZ8pnzmfSZ9Zn2mfe89rz3mfiZ+bz4mfqZ+7z5vPqZ/Jn9mf6aQZpCmkOaRLz7vPyaRbz9mka8/ppHvaGaSL2ivaOaSb2kmkqaS5pMmk2aTppPmlCaUZpSmlOaVJpVmlaaV5pYmlmaWpphmmK9pZpjmmSaZZpmmmeaaJppvaa9p5pqmmu9qJpsmm2abr2pmm+acJpxmnKac5p0mnW9qpp2mneaeJp5vauaepqBmoKag5qEmoW9rL2tmoaah72umoiaiZqKva+ai5qMmo2ajpqPmpCakb2wvbGakr2ympO9s5qUmpWalpqXmpiamb20vbWampqbmpyanZqemp+9tpqgmqGaopqjmqSapZqmvbeap5qovbiaqb25mqqaq5qsmq2arpqvvbq9u5qwmrG9vJqymrOatL29vb6atZq2mreauJq5mrq9v73Amru9wZq8vcKavZq+mr+awJrBmsKaw5rEmsWaxprHmsiayZrKmsuazJrNms6az5rQmtGa0prTmtSa1ZrWmtea2JrZmtqa25rcmt2a3r3DvcSa35rgvcWa4Zrivca9x5rjmuSa5Zrmmuea6L3Ivcm9yprpvcua6r3Mmuua7Jrtmu69zZrvvc69z5rwvdC90ZrxmvKa873SmvSa9Zr2mvea+Jr5mvq9073Umvua/L3Vvdaa/Zr+m0GbQptDvde92L3Zm0SbRb3am0abR5tIvdubSZtKm0ubTJtNm06bT73cvd2bUJtRvd6935tSm1ObVJtVm1abV5tYm1mbWpthm2KbY5tkm2WbZptnm2ibaZtqm2ubbJttm26bb5twm3Gbcr3gm3ObdJt1m3abd5t4m3mbepuBm4Kbg5uEm4WbhpuHm4ibiZuKm4ubjJuNm46bj5uQm5GbkpuTm5SblZuWm5ebmJuZm5q94b3im5ubnL3jm52bnpufveSboL3lm6Gbopujm6Sbpb3mveebppunvei96Zuom6mbqpurm6ybrb3qm66br5uwveubsZuym7O97Ju0m7Wbtpu3m7ibuZu6m7ubvJu9m76bv5vAm8GbwpvDm8SbxZvGm8ebyJvJm8qby5vMm82bzpvPm9Cb0ZvSm9Ob1JvVm9ab15vYm9mb2pvbm9yb3Zvem9+b4Jvhm+Kb45vkm+Wb5r3tm+eb6Jvpm+qb65vsm+2b7pvvm/Cb8Zvym/Ob9Jv1m/ab95v4m/mb+pv7m/yb/b3uve+b/pxBvfCcQpxDvfG98pxEvfOcRZxGnEecSJxJvfS99ZxKnEucTL32nE2cTpxPnFCcUZxSvfe9+JxTnFS9+ZxVnFacV5xYnFmcWpxhnGKcY5xknGWcZpxnnGicab36nGqca5xsnG2cbpxvnHC9+5xxnHKcc5x0nHWcdpx3nHiceZx6nIGcgpyDnISchZyGnIeciJyJvfycipyLnIycjZyOnI+ckL39nJGckpyTvf6clJyVnJa+oZyXnJicmZyanJucnJydvqK+o5yenJ+coJyhnKKco5yknKWcppynvqScqJypnKqcq5ysnK2crpyvnLCcsZyynLOctJy1nLact5y4nLmcupy7nLycvZy+nL+cwJzBnMK+pb6mnMOcxL6nnMWcxpzHvqicyJzJnMqcy5zMnM2czr6pvqqcz5zQnNG+q5zSnNOc1JzVnNac176snNic2ZzanNuc3JzdnN6c35zgnOGc4pzjnOSc5ZzmnOec6JzpnOq+rZzrnOyc7ZzunO+c8Jzxvq6c8pzznPSc9Zz2nPec+Jz5nPqc+5z8nP2c/p1BnUKdQ51EnUWdRp1HnUidSZ1KnUudTJ1NnU6+r51PnVCdUb6wnVKdU51UnVWdVp1XnVidWZ1anWGdYp1jnWSdZZ1mnWedaJ1pnWqda51snW2dbp1vnXCdcZ1ynXOddJ11nXadd514nXmdep2BnYKdg52EnYWdhp2HnYidib6xnYqdi52MnY2djp2PvrK+s52QnZG+tJ2SnZOdlL61nZW+tp2WnZedmJ2Zvre+uL65nZqdm52cnZ2dnp2fnaCdoZ2inaO+up2knaWdpr67naedqJ2pvrydqp2rnaydrZ2una+dsL69nbGdsp2znbSdtZ22nbeduJ25nbqdu76+vr+dvJ29vsCdvp2/ncC+wZ3BncKdw53EncWdxp3HvsK+w53IvsSdyb7Fncqdy53Mnc2dzp3Pvsa+x53QndG+yL7Jvsqd0r7Lvsy+zZ3TndSd1Z3Wvs6+z77Qnde+0b7SvtOd2J3Zndq+1L7Vndu+1r7Xndyd3b7Ynd6d353gvtmd4Z3ineOd5J3lnead577avtud6L7cvt2+3p3pneqd653sne2d7r7fvuCd753wvuGd8Z3ynfO+4p30nfW+4532nfed+J35vuS+5Z36vuad+77nnfyd/Z3+vuieQb7pvuqeQp5DnkS+655FnkaeR77snkieSZ5KnkueTJ5Nnk6eT77tnlCeUZ5SnlOeVJ5VnlaeV55Ynlm+7r7vnlqeYb7wvvGeYr7yvvO+9L71nmOeZJ5lnmaeZ772vve++L75vvq++778nmi+/Z5pvv6ear+hv6Kea55sv6OebZ5unm+/pJ5wnnGecp5znnSedZ52v6W/pp53v6eeeL+onnmeep6BnoKeg56Ev6m/qr+rnoW/rJ6GnoeeiL+tnom/rr+vnoqei56Mno2/sL+xv7K/s7+0v7Wejp6PnpC/tr+3v7i/uZ6RnpKek7+6npSelZ6Wv7uel56Ynpmemp6bnpyenb+8v72enr++v7+en56gnqGeop6jnqSepb/Av8Gepp6nv8KeqJ6pnqq/w7/Ev8Weq7/Gnqyerb/Hv8i/yZ6uv8qer7/LnrC/zJ6xnrKes560v82/zp61nra/z563nrieub/Qnrqeu568nr2evp6/nsC/0b/SnsG/07/Uv9Wewp7DnsSexZ7Gnse/1r/Xnsieyb/Ynsqey57Mns2ezp7PntCe0Z7SntOe1L/ZntWe1r/ante/257Yntme2p7bntye3b/cv92e3p7fv96e4J7hnuK/357jnuSe5Z7mnuee6J7pv+C/4Z7qv+Ke67/jnuye7Z7unu+e8J7xv+S/5Z7ynvO/5p70nvWe9r/nnvee+J75nvqe+578nv2/6L/pnv6/6p9Bv+ufQp9Dn0SfRZ9Gn0e/7L/tn0ifSb/un0qfS59Mv++/8L/xn02fTp9Pn1CfUb/yv/OfUr/0n1O/9Z9Un1WfVp9Xn1ifWb/2v/efWp9hv/ifYp9jn2S/+Z9ln2afZ59on2mfap9rv/q/+59sn22//L/9n26fb59wn3Gfcp9zv/7AoZ90n3XAop92n3efeMCjn3mfep+Bn4Kfg5+En4XApMCln4afh5+IwKafiZ+Kn4ufjJ+Nn47Ap8Con4+fkMCpn5Gfkp+TwKqflJ+Vn5afl5+Yn5mfmsCrwKyfm8Ctn5zArp+dn56fn5+gn6GfosCvwLCfo5+kwLGfpZ+mn6fAsp+on6mfqp+rn6yfrZ+uwLPAtJ+vwLWfsMC2n7HAt5+yn7OftJ+1wLjAuZ+2n7fAup+4n7mfusC7n7ufvJ+9n76fv8C8n8DAvcC+n8HAv5/CwMDAwcDCwMPAxMDFwMbAx5/Dn8SfxcDIn8afx5/IwMmfyZ/Kn8ufzJ/Nn86fz8DKn9Cf0cDLn9Kf05/Un9Wf1p/Xn9if2cDMwM2f2p/bwM6f3J/dn97Az8DQwNGf35/gn+Gf4sDSwNPA1J/jwNXA1sDXwNif5J/ln+bA2Z/nwNrA25/on+nA3J/qwN3A3sDfn+vA4J/sn+2f7p/vn/DA4cDin/HA48DkwOXA5p/yn/Of9J/1n/bA58Don/ef+MDpn/mf+p/7wOqf/J/9n/6gQaBCoEOgRMDrwOygRcDtwO7A76BGoEegSKBJoEqgS8DwwPGgTKBNwPKgTsDzoE/A9KBQoFGgUqBToFSgVaBWwPWgV6BYoFmgWsD2oGGgYqBjoGSgZaBmwPegZ6BooGnA+KBqoGugbMD5oG2gbqBvoHCgcaByoHOgdKB1oHagd6B4oHmgeqCBoIKgg6CEoIXA+sD7oIagh8D8oIigiaCKwP2gi8D+oIygjaCOoI+gkMGhwaKgkcGjoJLBpMGloJOglKCVoJagl8GmwaegmKCZwaigmqCboJzBqaCdoJ6gn6CgoKGgoqCjwarBq6CkwaygpcGtoKagp6CooKmgqqCrwa6grKCtoK7Br6CvoLCgscGwoLKgs6C0oLWgtqC3oLjBscGyoLmgusGzwbSgu6C8oL2gvqC/oMDBtaDBoMKgw6DEoMWgxqDHoMigyaDKoMugzKDNoM6gz6DQoNGg0qDToNSg1aDWoNeg2KDZoNqg28G2wbeg3KDdwbig3qDfoODBuaDhwbqg4qDjoOSg5aDmwbvBvKDnwb2g6MG+wb/BwKDpoOqg68HBwcLBw6DsoO2g7qDvoPCg8cHEoPKg86D0oPWg9qD3oPig+cHFoPrBxqD7wceg/KD9oP6hQaFCoUPByKFEoUWhRqFHoUihSaFKoUuhTKFNoU6hT6FQoVGhUqFToVShVaFWwcnByqFXoVihWaFaoWGhYsHLoWOhZKFlwcyhZqFnoWjBzaFpoWqha6FsoW2hbqFvwc7Bz6FwwdChccHRoXKhc6F0oXWhdqF3wdLB06F4oXnB1KF6oYGhgqGDoYShhaGGoYehiKGJoYqhi6GMoY2hjqGPwdWhkKGRoZKhk6GUoZXB1sHXoZahl8HYoZihmaGawdnB2sHboZuhnKGdoZ6hn8Hcwd2hoMHeokHB36JCokOiRKJFokaiR8HgokiiSaJKokuiTKJNok6iT6JQolGiUqJTolSiVaJWoleiWKJZolrB4aJhomKiY6JkomWiZqJnweKiaKJpomqia6Jsom2ibqJvonCicaJyonOidKJ1onaid6J4onmieqKBooKig6KEooWihqKHoojB48HkoomiisHloouijKKNweaijqKPopCikaKSopOilMHnweiilcHpopail6KYopmimqKbopyincHqop6in6KgweujQaNCo0PB7KNEo0WjRqNHo0ijSaNKwe2jS6NMo02jTqNPo1CjUaNSo1OjVKNVwe7B76NWo1fB8KNYo1mjWsHxo2GjYqNjo2SjZaNmo2fB8sHzo2jB9KNpwfWjaqNro2yjbaNuo2+jcKNxo3Kjc6N0o3WjdqN3o3ijeaN6o4GjgqODo4SjhaOGo4ejiKOJo4qji6OMo42jjqOPo5CjkcH2wfejkqOTwfijlKOVwfnB+qOWwfujl6OYo5mjmqObwfzB/aOcwf6jncKhwqKjnqOfwqPCpKOgwqXCpqRBpELCp6RDwqikRMKppEWkRsKqpEekSKRJpErCq8KspEvCrcKuwq+kTKRNpE6kT6RQpFHCsMKxpFKkU8KypFSkVaRWwrOkV6RYpFmkWqRhpGKkY8K0wrWkZMK2wrfCuKRlpGakZ6RopGmkasK5pGukbKRtwrqkbqRvpHCkcaRypHOkdKR1pHakd6R4pHmkeqSBpIKkg8K7pISkhaSGpIekiKSJpIqki6SMpI2kjqSPpJCkkaSSpJOklKSVpJakl6SYpJmkmqSbpJyknaSepJ+koKVBpUKlQ6VEpUXCvMK9pUalR8K+pUilSaVKwr+lS6VMpU2lTqVPpVClUcLAwsGlUsLCwsPCxKVTpVSlVaVWpVelWMLFpVmlWqVhpWKlY6VkpWWlZqVnpWilaaVqpWulbKVtpW6lb6VwpXGlcsLGpXOldKV1pXald6V4wseleaV6pYGlgqWDpYSlhaWGpYeliKWJpYqli6WMpY2ljqWPpZClkcLIpZKlk6WUpZWllqWXpZilmaWapZulnKWdpZ6ln6WgpkGmQqZDpkSmRaZGpkemSKZJpkqmS6ZMpk2mTqZPplCmUaZSplOmVMLJwsqmVaZWwsumV6ZYplnCzKZapmGmYqZjpmSmZaZmws3CzqZnws+maMLQpmnC0aZqpmumbKZtwtLC06Zupm+mcKZxpnKmc8LUpnSmdaZ2pnemeKZ5pnqmgaaCpoOmhMLVpoWmhqaHpoimiaaKpovC1qaMpo2mjqaPppCmkaaSppOmlKaVppaml6aYppmmmqabppymnaaewtemn6agp0GnQqdDp0SnRcLYp0anR6dIwtmnSadKp0vC2qdMp02nTqdPp1CnUadSwtvC3KdTp1SnVadWp1enWKdZp1qnYadip2OnZKdlp2anZ6dop2mnaqdrp2ynbadup2+ncKdxp3Knc6d0p3Wndqd3wt2neKd5p3qngaeCp4PC3sLfp4SnhcLgp4anh6eIwuGniaeKp4unjKeNp46nj8LiwuOnkKeRp5LC5KeTp5SnlaeWp5enmMLlp5mnmqebp5ynnaeep5+noKhBqEKoQ6hEqEWoRqhHqEioSahKqEvC5sLnqEyoTahOqE+oUKhRqFKoU6hUqFWoVqhXqFioWahaqGGoYqhjqGSoZahmqGeoaKhpqGqoa6hsqG2obqhvqHCocahyqHPC6Kh0qHWodqh3qHioeah6qIGogqiDqISohaiGqIeoiKiJqIqoi6iMqI2ojqiPqJCokaiSqJOolMLpqJWolqiXqJiomaiaqJuonKidqJ6on6igqUGpQqlDqUSpRalGqUepSKlJqUqpS6lMqU2pTqlPwuqpUKlRqVKpU6lUqVWpVqlXqVipWalaqWGpYqljqWTC66llqWbC7Klnwu2paKlpqWqpa6lsqW2pbqlvqXCpcalyqXOpdKl1qXapd6l4qXmpeqmBqYKpg6mEqYWphqmHqYipiamKqYupjKmNqY6pj8Luwu+pkKmRwvCpkqmTqZTC8amVqZapl6mYqZmpmqmbwvLC86mcqZ2pnsL0wvWpn6mgqkGqQsL2wvfC+KpDqkTC+apFwvqqRsL7qkeqSKpJqkqqS6pMqk3C/ML9qk7C/sOhw6LDo6pPqlCqUapSqlPDpMOlqlSqVcOmqlaqV6pYw6eqWapaqmGqYqpjqmSqZcOow6mqZsOqw6vDrKpnqmiqaapqqmuqbMOtqm2qbqpvw66qcMOvqnHDsKpyqnOqdKp1qnaqd6p4w7Gqeap6qoGqgsOyqoOqhKqFqoaqh6qIqomqiqqLqoyqjaqOqo+qkKqRqpKqk6qUqpWqlqqXqpiqmaqaqpuqnKqdqp6qn6qgq0GrQqtDq0TDs8O0q0WrRsO1q0erSKtJw7arSqtLq0yrTatOq0+rUMO3w7irUcO5w7rDu6tSq1OrVKtVq1arV8O8w72rWKtZw76rWqthq2LDv6tjq2SrZatmq2eraKtpw8DDwatqw8Kra8PDq2yrbatuq2+rcKtxw8Srcqtzq3TDxat1q3ard6t4q3mrequBq4Krg6uEq4WrhquHq4iricPGq4qri6uMq42rjquPq5DDx6uRq5Krk8PIq5SrlauWq5ermKuZq5qrm6ucq52rnqufq6CsQaxCrEPDyaxErEWsRqxHrEisScPKw8usSqxLw8ysTKxNrE7DzaxPrFCsUaxSrFOsVKxVw87Dz6xWw9CsV8PRrFisWaxarGGsYqxjw9KsZKxlrGbD06xnrGisacPUrGqsa6xsrG2sbqxvrHCscaxyrHOsdKx1w9Wsdqx3rHiseax6rIGsgqyDrISshayGrIesiKyJrIqsi6yMrI2sjqyPrJCskaySrJOslKyVrJasl6yYrJmsmqybrJysncPWrJ6sn6ygw9etQa1CrUPD2K1ErUWtRq1HrUitSa1Kw9nD2q1Lw9utTMPcrU2tTq1PrVCtUa1Sw92tU61UrVWtVq1XrVitWa1arWGtYq1jrWStZa1mrWfD3q1orWmtaq1rrWytba1urW+tcK1xrXLD38PgrXOtdMPhrXWtdq13w+KteK15rXqtga2CrYOthMPjw+SthcPlrYbD5q2HrYitia2KrYutjMPnrY2tjq2PrZCtka2SrZOtlK2VrZatl62YrZmtmq2brZytna2erZ/D6K2grkGuQq5DrkSuRa5Gw+muR65IrknD6q5KrkuuTK5Nrk6uT65QrlGuUq5TrlSuVa5WrleuWK5ZrlquYa5irmOuZK5lrmbD665nrmiuacPsrmqua65sw+2uba5urm+ucK5xrnKuc8Puw++udMPwrnXD8a52rneueK55rnqugcPyroKug66Ew/Ouha6GrofD9K6Iromuiq6Lroyuja6Ow/Wuj66QrpGuksP2rpOulK6Vrpaul66Yw/fD+K6ZrprD+a6brpyuncP6rp6un66gr0GvQq9Dr0TD+8P8r0XD/a9Gw/6vR69Ir0mvSq9Lr0yvTa9Or0+vUK9Rr1KvU69Ur1WvVq9Xr1ivWa9ar2GvYq9jr2SvZa9mr2evaK9pr2qva69sr22vbsShxKKvb69wxKOvca9yxKTEpcSmr3OvdK91r3avd694xKfEqK95xKmvesSqr4Gvgq+Dr4Svha+GxKvErK+Hr4jEra+Jr4qvi8Sur4yvja+Or4+vkK+Rr5LEr8Swr5PEsa+UxLKvla+Wr5evmK+Zr5rEs8S0r5uvnMS1r52vnq+fxLavoLBBsEKwQ7BEsEWwRsS3xLiwR8S5xLrEu7BIsEmwSrBLsEywTcS8xL2wTrBPsFCwUbBSsFOwVLBVsFawV7BYsFmwWrBhsGKwY7BksGWwZsS+sGewaLBpsGqwa7BssG2wbrBvsHCwcbBysHOwdLB1sHawd7B4sHmwerCBsIKwg7CEsIWwhrCHsIiwibCKsIuwjLCNsI7Ev8TAsI+wkMTBsJGwksTCxMOwk7CUsJWwlrCXsJiwmcTExMWwmsTGxMfEyLCbsJywnbCesJ+woMTJxMqxQbFCxMuxQ7FEsUXEzLFGsUexSLFJsUqxS7FMxM3EzrFNxM+xTsTQsU+xULFRsVKxU7FUxNGxVbFWsVfE0rFYsVmxWsTTsWGxYrFjsWSxZbFmsWfE1MTVsWjE1sTXxNixabFqsWuxbLFtsW7E2bFvsXCxcbFysXOxdLF1sXaxd7F4sXmxerGBsYKxg7GEsYWxhrGHsYixibGKsYuxjLGNsY6xj8TaxNuxkLGRxNyxkrGTsZTE3bGVsZaxl7GYsZmxmrGbxN7E37GcxOCxncThsZ6xn7GgskGyQrJDxOLE47JEskXE5LJGskeySMTlskmySrJLskyyTbJOsk/E5rJQslGyUrJTxOeyVLJVslayV7JYslnE6LJasmGyYrJjsmSyZbJmsmeyaLJpsmqya7Jssm2ybrJvsnCycbJysnPE6bJ0snWydrJ3sniyecTqsnqygbKCsoOyhLKFsobE67KHsoiyibKKsouyjLKNso6yj7KQspGykrKTspSylbKWspeymLKZxOyymrKbspyynbKesp+yoLNBs0KzQ7NEs0WzRrNHs0izSbNKs0uzTLNNs06zT7NQs1GzUrNTs1TE7cTus1WzVsTvs1ezWLNZxPCzWrNhs2KzY7Nks2WzZsTxxPKzZ8Tzs2jE9LNps2qza7Nss22zbsT1s2+zcLNxxPazcrNzs3TE97N1s3azd7N4s3mzerOBs4Kzg7OEs4WzhsT4s4eziLOJs4qzi7OMxPmzjbOOs4+zkLORs5Kzk7OUs5WzlrOXs5izmbOas5uznLOds56zn7OgxPq0QbRCtEO0RLRFtEbE+8T8tEe0SMT9tEm0SrRLxP60TLRNtE60T7RQtFG0UsWhxaK0U8WjtFTFpLRVtFa0V7RYtFm0WsWltGG0YrRjxaa0ZLRltGbFp7RntGi0abRqtGu0bLRtxai0brRvtHC0cbRytHO0dLR1tHa0d7R4xanFqrR5tHrFq7SBtIK0g8WstIS0hbSGtIe0iLSJtIrFrcWutIu0jLSNxa+0jrSPtJC0kbSStJO0lLSVtJa0l7SYtJm0mrSbtJy0nbSetJ+0oLVBtUK1Q7VEtUW1RrVHtUi1SbVKtUu1TLVNtU61T8WwxbG1ULVRxbK1UrVTtVTFs7VVtVa1V7VYtVm1WrVhxbTFtbVixba1Y8W3tWS1ZbVmtWe1aLVpxbjFubVqtWvFurVstW21bsW7xby1b7VwtXG1crVztXTFvcW+tXXFv8XAxcG1drV3tXi1ebV6tYHFwsXDtYK1g8XEtYS1hbWGxcW1h7WItYm1irWLtYy1jcXGxce1jsXIxcnFyrWPtZC1kbWStZO1lMXLtZW1lrWXtZi1mbWatZu1nLWdtZ61n7WgtkG2QrZDtkS2RbZGtke2SMXMtkm2SrZLtky2TbZOtk+2ULZRtlK2U7ZUtlW2VrZXtli2WbZatmG2YrZjtmS2ZbZmtme2aLZptmq2a7Zstm22brZvtnDFzcXOtnG2csXPtnO2dLZ1xdC2dsXRtne2eLZ5tnq2gcXSxdO2gsXUxdXF1raDtoS2hbaGtoe2iMXXxdi2ibaKxdm2i7aMto3F2raOto+2kLaRtpK2k7aUxdvF3LaVxd22lsXetpe2mLaZtpq2m7acxd+2nbaetp/F4Lagt0G3QrdDt0S3RbdGt0e3SLdJt0q3S7dMt023TsXht0+3ULdRt1K3U7dUt1XF4rdWt1e3WMXjt1m3Wrdht2K3Y7dkt2W3Zrdnt2i3abdqt2u3bLdtt263b7dwt3G3crdzt3S3dcXkxeW3drd3xea3eLd5t3rF57eBt4K3g7eEt4W3hreHxejF6beIxeq3icXrt4q3i7eMt43F7LeOxe23j7eQt5HF7reSt5O3lLeVt5a3l7eYt5m3mrebt5y3nbeet5+3oLhBuEK4Q7hEuEW4RrhHuEjF77hJuEq4S7hMuE24TrhPuFC4UbhSuFO4VLhVuFa4V7hYuFm4WrhhuGK4Y7hkuGW4ZrhnuGi4acXwuGq4a7hsxfG4bbhuuG+4cLhxuHK4c7h0uHW4drh3uHi4ebh6xfK4gcXzuIK4g7iEuIW4hriHxfS4iLiJuIq4i7iMuI24jriPuJC4kbiSuJO4lLiVuJa4l7iYuJm4mribuJy4nbieuJ+4oLlBuULF9cX2uUO5RMX3uUW5RrlHxfi5SLlJuUq5S7lMuU25TsX5xfq5T8X7uVDF/LlRuVK5U7lUuVW5VsX9uVe5WLlZuVq5YbliuWO5ZLlluWa5Z7louWm5arlruWy5bbluuW/F/rlwuXG5crlzuXS5dbl2xqG5d7l4uXm5ermBuYK5g7mEuYW5hrmHuYi5ibmKuYu5jLmNuY65j7mQuZG5krmTuZS5lbmWuZfGosajuZi5mcakuZq5m7mcxqW5nbmeuZ+5oLpBukK6Q8amxqe6RLpFukbGqLpHuki6SbpKuku6TMapuk26TrpPxqq6ULpRulLGq7pTulS6VbpWule6WLpZxqy6WrphumK6Y8atumS6Zbpmume6aLppxq7Gr7pqumvGsLpsum3Gscayum7Gs7pvunC6cbpyunPGtMa1unTGtrp1una6d7p4unm6erqBuoLGt7qDuoS6hca4uoa6h7qIxrm6ibqKuou6jLqNuo66j8a6xru6kLqRupK6k7qUupW6lrqXupi6mca8xr26mrqbxr66nLqdup7Gv7qfuqC7QbtCu0O7RLtFxsDGwbtGxsK7R8bDu0i7SbtKu0u7TLtNxsTGxcbGu07Gx7tPu1C7UcbIu1LGybtTu1S7VbtWu1fGysbLu1jGzMbNxs67Wbtau2HGz7tiu2PG0MbRu2S7ZcbSu2a7Z7toxtO7abtqu2u7bLttu267b8bUxtW7cMbWxtfG2Ltxu3K7c7t0u3W7dsbZxtq7d7t4u3m7eruBu4K7g7uEu4W7hruHu4i7ibuKu4u7jLuNu467j7uQu5G7kruTu5S7lbuWu5e7mLuZu5q7m7ucu527nrufu6C8QbxCvEO8RLxFvEa8R7xIvEm8SrxLvEy8TbxOvE+8ULxRvFLG28bcvFO8VMbdvFW8VrxXxt68WLxZvFq8YbxivGO8ZMbfxuC8ZcbhxuLG47xmvGe8aLxpvGq8a8bkxuW8bLxtxua8brxvvHDG57xxvHK8c7x0vHW8drx3xujG6bx4xuq8ecbrvHq8gbyCvIO8hLyFxuy8hryHvIjG7byJvIq8i8buvIy8jbyOvI+8kLyRvJLG78bwvJO8lMbxxvK8lbyWvJe8mLyZvJrG87ybvJy8nbyevJ+8oL1BxvS9Qr1DvUS9Rb1GvUe9SL1JxvW9Ssb2vUu9TL1NvU69T71QvVG9Usb3xvi9U71Uxvm9Vb1WvVfG+r1YvVm9Wr1hvWK9Y71kxvvG/L1lxv29Zsb+vWe9aL1pvWq9a71sx6G9bb1uvW+9cL1xvXK9c710vXW9dr13vXi9eb16vYG9gr2DvYS9hb2Gx6K9h72IvYm9ir2LvYy9jb2OvY+9kL2RvZK9k72UvZW9lr2XvZi9mb2avZu9nL2dvZ69n72gvkG+Qr5DvkS+Rb5Gvke+SMejvkm+Sr5Lx6S+TL5Nvk6+T75QvlG+Ur5TvlS+Vb5Wvle+WL5Zvlq+Yb5ivmO+ZL5lvma+Z75ox6W+ab5qvmvHpr5svm2+bsenvm++cL5xvnK+c750vnW+dseovnfHqb54vnm+er6BvoK+g76EvoXHqservoa+h8esvoi+icetx66+isevvou+jL6Nvo6+j8ewx7G+kMeyvpHHs76SvpO+lL6Vvpa+l8e0vpi+mb6avpu+nL6dvp6+n76gv0G/Qr9Dv0S/Rb9Gv0e/SL9Jv0q/S8e1v0y/Tb9Ov0+/UL9Rv1K/U79Uv1W/Vr9Xv1i/Wb9av2G/Yr9jv2S/Zb9mv2e/aL9pv2q/a79sv22/br9vv3C/cb9yv3PHtr90v3W/dse3v3e/eL95x7i/er+Bv4K/g7+Ev4W/hse5v4e/iMe6v4m/ir+Lv4y/jb+Ov4+/kMe7v5G/kr+Tx7y/lL+Vv5bHvb+Xv5i/mb+av5u/nL+dx76/nr+fx7+/oMfAwEHAQsBDwETARcBGx8HAR8BIwEnHwsBKwEvATMfDwE3ATsBPwFDAUcBSwFPHxMfFwFTHxsBVwFbAV8BYwFnAWsBhwGLAY8BkwGXAZsBnwGjAacBqwGvAbMBtwG7Ab8BwwHHAcsBzwHTAdcB2wHfAeMB5wHrAgcCCwIPAhMfHx8jAhcCGx8nAh8CIwInHysCKwIvAjMCNwI7Aj8CQx8vHzMCRx83AksfOwJPAlMCVwJbAl8CYx8/H0MCZwJrH0cCbwJzAncfSwJ7An8CgwUHH08FCwUPH1MfVwUTH1sFFx9fBRsFHwUjBScFKwUvH2MfZwUzBTcfawU7BT8FQx9vBUcFSwVPBVMFVwVbBV8fcx93BWMfex9/H4MFZwVrBYcFiwWPBZMfhwWXBZsFnwWjBacFqwWvBbMFtwW7Bb8FwwXHBcsFzwXTBdcF2wXfBeMfiwXnBesGBwYLBg8GEwYXBhsGHwYjBicGKwYvBjMGNwY7Bj8GQwZHBksGTwZTBlcGWwZfBmMGZwZrBm8GcwZ3BnsGfwaDH48fkwkHCQsflwkPCRMJFx+bCRsfnwkfCSMJJwkrCS8fox+nCTMfqwk3H68JOwk/CUMJRwlLCU8fsx+3CVMJVx+7CVsJXwljH78JZwlrCYcJiwmPCZMJlx/DH8cJmx/LCZ8fzwmjCacJqwmvCbMJtx/TH9cJuwm/H9sJwwnHCcsf3wnPCdMJ1wnbCd8J4wnnH+Mf5wnrH+sf7x/zCgcKCwoPChMKFwobH/cKHwojCicf+worCi8KMyKHCjcKOwo/CkMKRwpLCk8KUyKLClcKWwpfCmMKZwprCm8Kcwp3CnsijyKTCn8KgyKXDQcNCw0PIpsNEw0XDRsNHyKfDSMNJyKjIqcNKyKrDS8irw0zDTcNOyKzDT8NQyK3IrsNRw1LIr8NTw1TDVciww1bDV8NYw1nDWsNhw2LDY8Nkw2XIscNmyLLDZ8Now2nDasNrw2zIs8i0w23Dbsi1w2/DcMNxw3LDc8N0w3XDdsN3w3jDecN6w4HDgsi2w4PIt8OEw4XDhsOHw4jDici4yLnDisOLyLrDjMONw47Iu8OPw5DDkcOSw5PDlMOVw5bIvMOXyL3DmMi+w5nDmsObw5zDncOeyL/Dn8OgxEHIwMRCxEPERMjBxEXERsRHxEjEScRKxEvETMjCxE3Iw8ROxE/EUMRRxFLEU8RUxFXIxMjFxFbEV8jGxFjEWcRayMfEYcRixGPEZMjIxGXEZsjJxGfEaMjKxGnIy8RqxGvEbMRtxG7Eb8jMxHDEccRyyM3Ec8R0xHXIzsR2xHfEeMR5xHrEgcSCyM/Eg8SExIXEhsjQxIfEiMSJxIrEi8SMyNHI0sSNxI7I08SPxJDEkcjUxJLEk8SUxJXElsSXxJjEmcSaxJvEnMSdyNXEnsSfxKDFQcVCxUPI1sjXxUTFRcjYxUbFR8VIyNnFScVKxUvFTMVNxU7FT8jayNvFUMjcxVHI3cVSxVPFVMVVxVbFV8jeyN/FWMVZyODFWsVhxWLI4cVjxWTFZcVmxWfFaMVpyOLFasVryOPFbMjkxW3FbsVvxXDFccVyyOXI5sVzxXTI58V1yOjI6cjqyOvFdsV3xXjFecV6xYHI7MjtxYLI7sWDyO/FhMWFxYbI8MWHxYjI8cWJxYrFi8jyxYzFjcWOyPPFj8WQxZHFksWTxZTFlcj0yPXFlsWXxZjI9sWZxZrFm8WcxZ3Fnsj3yPjFn8WgyPnGQcZCxkPI+sZExkXGRsZHxkjGScZKyPvI/MZLyP3GTMj+xk3GTsZPxlDGUcZS";
+    const HANGUL_CP949_B64 = "sKGwooFBgUKwo4FDgUSwpLClsKawp4FFgUaBR4FIgUmwqLCpsKqwq7CssK2wrrCvgUqwsLCxsLKws7C0gUuBTLC1gU2BToFPsLaBUIFRgVKBU4FUgVWBVrC3sLiBV7C5sLqwu4FYgVmBWoFhgWKBY7C8sL2BZIFlsL6BZoFngWiwv4FpgWqBa4FsgW2BboFvgXCBcYFysMCBc7DBgXSBdYF2gXeBeIF5sMKBeoGBgYKww4GDgYSBhbDEgYaBh4GIgYmBioGLgYyBjYGOgY+BkIGRgZKBk4GUgZWBloGXgZiwxbDGgZmBmrDHgZuBnLDIsMmBnbDKgZ6Bn4GggaGBorDLsMyBo7DNsM6wz7DQgaSBpbDRsNKw07DUgaaBp4GosNWBqYGqgauw1oGsga2BroGvgbCBsYGysNew2IGzsNmw2rDbgbSBtYG2gbeBuIG5sNyw3bDegbqw34G7gbyw4LDhgb2BvoG/gcCBwYHCgcOw4rDjgcSw5LDlsOaBxYHGgcew54HIgcmw6IHKgcuBzLDpgc2BzoHPsOqB0IHRgdKB04HUgdWB1oHXsOuB2LDsgdmB2oHbgdyB3YHegd+B4LDtsO6B4YHisO+B44HksPCw8YHlsPKB5rDzgeeB6LD0sPWw9oHpsPeB6rD4sPmB64Hsge2B7oHvsPqw+4HwgfGw/IHygfOB9LD9gfWw/oH2gfeB+IH5gfqxobGigfuxo4H8saSB/YH+gkGCQoJDgkSxpYJFgkaCR7GmgkiCSYJKsaeCS4JMgk2CToJPglCCUYJSsaiCU4JUsamxqoJVglaCV4JYglmCWrGrsayCYYJisa2CY4JkgmWxroJmgmeCaIJpgmqCa4Jssa+xsIJtsbGCbrGygm+CcIJxgnKCc4J0sbOCdYJ2gnextIJ4gnmCerG1goGCgoKDgoSChYKGgoeCiLG2gomxt4KKgouCjIKNgo6Cj4KQgpGxuLG5gpKCk7G6gpSClbG7sbyxvbG+gpaCl4KYgpmxv7HAscGCmrHCgpuxw7HEgpyCnYKegp+CoLHFscaCoYKisceCo4KkgqWxyIKmgqeCqIKpgqqCq4Ksgq2CroKvgrCxybHKgrGCsoKzgrSCtYK2scuCt4K4grmCuoK7gryCvYK+gr+CwILBgsKCw4LEgsWCxoLHgsixzILJgsqCy4LMgs2CzoLPgtCxzbHOgtGC0rHPgtOC1ILVsdCC1oLXgtiC2YLagtuC3LHRsdKC3bHTgt6C34LgguGC4oLjguSC5bHUguaC54LosdWC6YLqguux1oLsgu2C7oLvgvCC8YLygvOC9IL1gvaC94L4gvmC+oL7gvyC/YL+sdex2INBg0Kx2YNDg0Sx2rHbsdyDRYNGg0eDSINJg0qx3bHeg0ux34NMseCDTYNOg0+DUINRg1Kx4YNTg1SDVYNWg1eDWINZg1qDYYNig2ODZINlg2aDZ4Nog2mDaoNrg2yDbYNug2+DcINxg3KDc7HiseODdIN1seSDdoN3seWx5oN4seeDeYN6g4GDgoODseix6YOEseqDhbHrseyDhoOHg4ix7YOJse6x77Hwg4qx8YOLg4yDjbHyg46x84OPg5CDkYOSg5Ox9LH1g5Sx9rH3sfiDlYOWg5ex+YOYg5mx+rH7g5qDm7H8g5yDnYOesf2Dn4Ogg6GDooOjg6SDpbH+sqGDprKisqOypIOng6iDqYOqg6uDrLKlsqaDrYOug6+DsIOxg7Kyp4Ozg7SDtYO2g7eDuIO5g7qDu4O8g72DvoO/g8CDwYPCg8ODxIPFg8aDx4PIg8mDyoPLg8yDzYPOg8+D0IPRg9KD04PUg9WD1oPXg9iD2YPag9uD3IPdg96D34Pgg+GyqLKpsqqD4rKrg+OD5IPlsqyD5oPng+iD6YPqg+uD7LKtsq6D7bKvsrCysYPug++D8IPxg/KD87KysrOD9IP1srSD9oP3g/iD+YP6g/uD/IP9g/6EQYRCsrWEQ4REsraERbK3hEaER4RIhEmESoRLsriETIRNhE6yuYRPhFCEUbK6hFKEU4RUhFWEVoRXhFiEWYRahGGyu7K8hGKEY4RkhGWyvYRmhGeyvoRohGmEaoRrhGyEbYRuhG+EcIRxhHKEc4R0hHWEdoR3hHiEeYR6hIGEgoSDhISEhYSGhIeEiLK/ssCEiYSKssGEi7LChIyyw4SNhI6Ej4SQhJGEkoSTssSyxYSUssaElbLHssiyyYSWhJeEmISZssqyy4SahJuEnISdhJ6En7LMhKCEoYSihKOEpISlhKaEp4SohKmEqrLNss6Eq4SshK2EroSvhLCyz7LQhLGEsoSzhLSEtYS2hLeEuIS5hLqEu4S8hL2EvoS/hMCEwYTChMOy0YTEhMWExoTHhMiEybLShMqEy4TMstOEzYTOhM+y1ITQhNGE0oTThNSE1YTWstWy1oTXhNiE2bLXhNqE24TchN2E3oTfstiE4IThhOKE44TkhOWE5oTnhOiE6YTqhOuE7ITthO6E74TwhPGE8oTzhPSE9YT2hPeE+IT5hPqy2bLahPuE/LLbhP2E/oVBstyFQoVDhUSFRYVGhUey3bLest+FSLLghUmy4bLihUqFS4VMhU2FTrLjhU+FUIVRhVKFU4VUhVWy5IVWhVeFWIVZhVqFYYVihWOFZIVlhWay5bLmhWeFaIVphWqFa4Vssuey6IVthW6y6YVvhXCFcbLqhXKFc4V0hXWFdoV3hXiy67LshXmFerLthYGFgoWDhYSFhYWGhYey7oWIhYmFirLvhYuFjIWNsvCFjoWPhZCFkYWShZOFlLLxsvKFlYWWhZeFmIWZhZqFm4WchZ2FnrLzhZ+FoIWhhaKFo4WkhaWFpoWnhaiFqYWqhauFrIWtha6Fr4WwhbGFsoWzhbSFtYW2hbeFuIW5svSy9YW6hbuy9oW8sveFvbL4hb6y+YW/hcCFwYXCsvqy+7L8hcOy/YXEsv6FxYXGhcezoYXIhcmFyoXLhcyFzYXOhc+F0IXRhdKF04XUhdWF1oXXhdiF2YXahduF3IXdhd6F34XgheGF4oXjheSF5bOis6OF5oXns6SF6IXpheqzpYXrheyF7YXuhe+F8IXxs6azp4Xys6iF87OphfSF9YX2hfeF+IX5s6qzq7OshfqzrYX7hfyzrrOvs7CzsYX9hf6GQYZChkOzsrOzhkSztLO1s7azt7O4hkWzuYZGs7qzu7O8hkeGSLO9hkmGSoZLs76GTIZNhk6GT4ZQhlGGUrO/s8CGU7PBs8Kzw4ZUhlWGVoZXhliGWbPEs8WGWoZhs8aGYoZjhmSzx4ZlhmaGZ4ZohmmGaoZrs8iGbIZthm6Gb7PJhnCGcYZyhnOGdIZ1hnaGd4Z4hnmGeoaBhoKGg4aEhoWGhoaHhoiGiYaKhouGjIaNho6Gj4aQhpGGkoaThpSGlYaWhpezyrPLhpizzLPNhpmGmoabs86GnLPPs9CGnYaehp+GoLPRs9KGobPTs9Sz1YaihqOGpIalhqaz1rPXs9iGp4aos9mGqYaqhquz2oashq2GroavhrCGsYays9uz3Iazs92z3rPfhrSGtYa2hreGuIa5s+Cz4Ya6hruz4oa8hr2GvrPjhr+GwIbBhsKGw4bEhsWz5LPlhsaGx7Pms+eGyIbJs+iGyobLhsyz6YbNhs6Gz7PqhtCG0YbShtOG1IbVhtaG14bYhtmG2obbhtyG3Ybeht+G4IbhhuKG44bkhuWG5rPrs+yG54bos+2G6Ybqhuuz7obss++G7Ybuhu+G8Ibxs/Cz8Ybys/KG87PzhvSG9Yb2hvez9LP1s/aG+Ib5hvqz94b7hvyG/bP4hv6HQYdCh0OHRIdFh0aHR4dIh0mHSrP5h0uHTIdNh06HT4dQh1GHUodTh1SHVYdWh1eHWIdZh1qHYYdih2OHZIdlh2aHZ4doh2mHaodrh2yHbYduh2+HcIdxh3KHc7P6h3SHdYd2s/uHd4d4h3mz/Id6h4GHgoeDh4SHhYeGs/2z/oeHtKGHiIeJh4qHi4eMh42HjoePtKK0o4eQh5G0pIeSh5OHlLSlh5WHloeXh5iHmYeah5uHnLSmh520p4eetKiHn4egh6GHooejh6S0qbSqh6WHprSrh6eHqLSstK2HqYeqh6uHrIeth66Hr7SutK+HsLSwh7G0sYeyh7OHtIe1h7aHt7Syh7iHuYe6h7uHvIe9h76Hv4fAh8GHwofDh8SHxYfGh8eHyIfJh8q0s4fLh8yHzYfOh8+H0IfRtLSH0ofTh9SH1YfWh9eH2IfZh9qH24fch92H3offh+CH4Yfih+OH5Iflh+aH54foh+mH6ofrh+y0tYfth+6H77S2h/CH8YfytLeH84f0h/WH9of3h/iH+bS4tLmH+of7h/yH/Yf+iEGIQohDiESIRbS6tLuIRohHiEiISYhKiEu0vIhMiE2ITohPiFCIUYhStL20vohTiFSIVbS/iFaIV4hYiFmIWohhtMC0wYhiiGO0wohkiGWIZrTDtMS0xYhniGiIaYhqiGu0xrTHiGy0yIhttMm0yohuiG+IcLTLiHG0zIhyiHOIdLTNiHWIdoh3tM6IeIh5iHqIgYiCiIOIhIiFiIaIh4iIiImIioiLiIyIjYiOiI+IkLTPtNCIkYiStNGIk4iUiJW00oiWtNOIl4iYiJmImoibtNS01YictNaInbTXiJ6In4igiKG02IiitNm02rTbiKO03IikiKW03bTetN+04LThiKaIp4iotOK047TkiKm05bTmtOe06LTpiKqIq4istOq067TsiK2IrrTtiK+IsIixtO6IsoiziLSItYi2iLeIuLTvtPCIubTxtPK084i6iLuIvIi9iL6Iv7T0iMCIwYjCiMOIxIjFiMaIx4jIiMmIyojLiMyIzYjOiM+I0IjRiNKI04jUiNWI1ojXiNiI2YjaiNuI3IjdiN6I34jgiOGI4ojjiOSI5YjmiOeI6IjpiOqI64jsiO2I7ojviPCI8YjyiPOI9Ij1iPa09bT2tPeI97T4iPiI+bT5tPqI+rT7tPyI+4j8iP2I/rT9tP6JQbWhiUK1oolDtaOJRIlFtaSJRrWltaaJR4lItaeJSYlKiUu1qIlMiU2JTolPiVCJUYlStam1qolTtau1rLWtiVSJVYlWiVeJWIlZta6JWolhiWK1r4ljiWSJZbWwiWaJZ4loiWmJaolriWyJbYluiW+JcLWxtbKJcYlyiXOJdIl1iXa1s4l3iXiJebW0iXqJgYmCiYOJhImFiYaJh4mIiYmJiomLiYyJjYmOiY+JkImRiZKJk4mUiZWJlrW1tbaJl4mYtbeJmYmatbi1uYmbtbqJnLW7iZ2Jnomftby1vYmgtb6JobW/iaK1wImjtcGJpImltcKJpomniai1w4mpiaqJq7XEiayJrYmuia+JsImxibKJs4m0ibWJtom3ibiJuYm6ibuJvIm9ib61xYm/icCJwYnCicOJxInFicaJx4nIicmJyonLicyJzYnOic+J0InRtcaJ0onTidSJ1YnWideJ2LXHidmJ2onbtciJ3Indid61yYnfieCJ4YniieOJ5Inltcq1y4nmtcyJ54noiemJ6onrieyJ7Ynutc2J74nwifGJ8onzifSJ9Yn2ifeJ+In5ifqJ+4n8if2J/opBikKKQ4pEikWKRopHikiKSYpKiku1zrXPikyKTbXQik6KT4pQtdGKUYpSilOKVIpVilaKV7XStdOKWLXUilm11YpaimGKYopjimSKZbXWimaKZ4poimmKaoprimyKbYpuim+KcIpxinKKc4p0inWKdop3ini114p5inqKgYqCioOKhIqFtdiKhoqHioiKiYqKiouKjIqNio6Kj4qQipGKkoqTipSKlYqWipeKmIqZtdmKmoqbipyKnYqeip+12oqgiqGKorXbiqOKpIqltdyKpoqniqiKqYqqiquKrIqttd2KrrXeiq+134qwirGKsoqzirSKtbXgiraKt4q4teGKuYq6iru14oq8ir2Kvoq/isCKwYrCteOKw4rEisWKxrXkiseKyIrJisqKy4rMteW15orNis6154rPitC16LXpitG16orSitOK1IrVita167Xsite17YrYte6K2YraituK3Irdit6174rfiuCK4YriiuOK5IrliuaK54roiumK6orriuyK7Yruiu+K8IrxivKK84r0ivWK9or3iviK+bXwtfGK+or7tfKK/Ir9tfO19Ir+i0GLQotDi0SLRYtGtfW19otHtfe1+LX5tfqLSItJi0qLS4tMtfu1/ItNi061/YtPi1CLUbX+i1KLU4tUi1WLVotXi1i2obaii1m2o7aktqWLWothi2KLY4tktqa2p7aoi2WLZrapi2eLaItptqqLaotri2yLbYtui2+LcLartqyLcbattq62r4tyi3OLdIt1i3aLd4t4i3mLeouBi4KLg4uEi4WLhouHi4iLiYuKi4uLjIuNi46Lj4uQi5GLkouTi5SLlYuWi5eLmIuZi5qLm4uci52Lnoufi6CLoYuii6OLpIuli6aLp4uoi6mLqouri6yLrYuui6+LsIuxi7KLs4u0i7W2sLaxi7aLt7ayi7iLuYu6trOLu7a0trWLvIu9i76Lv7a2treLwLa4trm2uovBi8KLw4vEi8W2u7a8tr2LxovHtr6LyIvJi8q2v4vLi8yLzYvOi8+L0IvRtsC2wYvStsK2w7bEi9OL1IvVi9aL14vYtsWL2Yvai9uL3Ivdi96L34vgi+GL4ovji+SL5Yvmi+eL6Ivpi+qL67bGi+yL7Yvui++L8Ivxi/KL84v0i/WL9ov3i/iL+Yv6i/uL/Iv9i/6MQYxCjEOMRIxFjEaMR4xIjEmMSoxLjEyMTYxOjE+MULbHtsiMUYxStsmMU4xUjFW2yoxWjFeMWIxZjFqMYYxijGOMZIxljGaMZ7bLjGiMaYxqjGuMbIxttsyMboxvjHCMcYxyjHOMdLbNjHWMdox3jHiMeYx6jIGMgoyDjISMhYyGjIeMiIyJjIqMi4yMjI22zoyOjI+MkIyRjJKMk4yUjJWMloyXjJiMmYyajJuMnIydjJ6Mn4ygjKGMooyjjKSMpYymjKeMqLbPjKmMqoyrttCMrIytjK6Mr4ywjLGMsoyzjLSMtYy2jLeMuIy5jLqMu4y8jL2Mvoy/jMCMwYzCjMOMxIzFjMaMx4zIjMmMyozLjMyMzYzOjM+M0IzRjNKM04zUjNWM1ozXjNiM2YzajNuM3IzdjN620bbSjN+M4LbTjOGM4ozjttSM5IzljOaM54zojOm21bbWjOqM64zsjO2214zujO+M8IzxjPKM84z0jPWM9oz3jPiM+Yz6jPuM/Iz9jP6NQY1CjUONRI1FjUaNR41IjUmNSo1LjUyNTY1OjU+NUI1RttiNUo1TjVSNVY1WjVeNWI1ZjVqNYY1ijWONZI1ljWaNZ41ojWmNao1rjWyNbY1ujW+NcI1xjXK22Y1zjXSNdbbajXaNd414ttuNeY16jYGNgo2DjYSNhbbctt2Nho2HjYi23o2JjYqNi42MjY2Njo2PjZCNkY2SjZONlI2VjZaNl42YjZmNmo2bjZyNnY2ejZ+NoI2hjaKNo42kjaWNpo2njaiNqY2qtt+24I2rjay24Y2tja624rbjja+NsI2xjbKNs420jbW25Lbljba25o23jbiNuY26jbuNvI29jb62542/jcCNwbbojcKNw43EtumNxY3GjceNyI3JjcqNy7bqtuuNzI3Njc6Nz43QjdGN0o3TjdSN1bbsjdaN143Ytu2N2Y3ajdu27o3cjd2N3o3fjeCN4Y3itu+28I3jtvGN5LbyjeWN5o3njeiN6Y3qtvO29I3rjey29Y3tje6N77b2jfCN8Y3yjfON9I31jfa297b4jfe2+bb6tvu2/I34jfmN+rb9tv63obeijfuN/Lejjf2N/o5Bt6SOQo5DjkSORY5GjkeOSLelt6aOSbent6i3qY5KjkuOTI5Njk6OT7eqt6uOUI5Rt6yOUo5TjlSOVY5WjleOWI5ZjlqOYY5ijmOOZI5lt62OZreujmeOaI5pjmqOa45sjm2Obo5vjnCOcY5yjnOOdI51jnaOd454jnmOeo6BjoKOg46EjoWOho6HjoiOiY6KjouOjI6Njo63r7ewjo+OkLexjpGOko6Tt7KOlI6VjpaOl46YjpmOmrezt7SOm7e1t7a3t46cjp2Ono6fjqC3uLe5t7qOoY6it7uOo46kjqW3vI6mjqeOqI6pjqqOq46st723vo6tt7+OrrfAjq+OsI6xjrKOs460t8G3wo61jra3w463jriOubfEjrqOu468jr2Ovo6/jsC3xbfGjsG3x7fIt8mOwo7DjsSOxY7Gjse3yo7IjsmOyrfLjsuOzI7Njs6Oz47QjtGO0o7TjtSO1Y7Wt8yO17fNjtiO2Y7ajtuO3I7djt6O37fOt8+O4I7ht9CO4o7jjuS30Y7ljuaO547ojumO6o7rt9K3047st9SO7bfVju6O747wjvGO8o7zt9aO9I71jva31473jviO+Y76jvuO/I79jv6PQY9Cj0OPRI9Fj0aPR49It9iPSY9Kj0uPTI9Nj06PT49Qj1GPUo9Tj1SPVY9Wj1ePWI9Zj1qPYY9ij2OPZI9lj2aPZ49ot9mPaY9qj2uPbI9tj26Pb7faj3CPcY9yt9uPc490j3W33I92j3ePeI95j3qPgY+Ct9233o+Dt9+PhLfgj4WPho+Hj4iPiY+Kt+GPi4+Mj4234o+Oj4+PkLfjj5GPko+Tj5SPlY+Wj5ePmLfkj5m35Y+at+aPm4+cj52Pno+fj6C357foj6GPorfpj6OPpI+lt+qPpo+nj6iPqY+qj6uPrLfrt+yPrbftj6637o+vj7CPsY+yj7OPtLfvj7WPto+3j7iPuY+6j7uPvI+9j76Pv4/Aj8GPwo/Dj8SPxY/Gj8e38I/Ij8mPyo/Lj8yPzY/Ot/GPz4/Qj9GP0o/Tj9SP1Y/Wj9eP2I/Zj9qP24/cj92P3o/fj+CP4Y/ij+OP5I/lj+aP54/oj+m38rfzj+qP67f0j+yP7Y/ut/WP74/wj/GP8o/zj/SP9bf2j/aP97f3j/i3+I/5j/qP+4/8j/2P/rf5t/qQQZBCt/uQQ5BEkEW3/JBGkEeQSJBJkEqQS5BMt/23/pBNuKGQTriikE+QUJBRkFKQU5BUuKO4pJBVkFa4pZBXkFiQWbimkFqQYZBikGOQZJBlkGa4p7iokGe4qZBouKq4q5BpkGq4rLitkGuQbJBtkG6Qb5BwkHGQcpBzkHSQdZB2kHeQeJB5kHqQgZCCkIOQhJCFkIaQh5CIkImQipCLkIyQjbiuuK+QjpCPuLCQkJCRkJK4sZCTkJSQlZCWkJeQmJCZuLK4s5CauLSQm7i1kJyQnZCekJ+QoJChuLa4t5CikKO4uJCkuLm4uri7uLy4vZClkKaQp5CokKm4vri/kKq4wJCruMG4wpCskK24w5CuuMS4xbjGkK+QsLjHkLGQspCzuMiQtJC1kLaQt5C4kLmQurjJuMqQu7jLuMy4zbjOkLyQvZC+kL+QwLjPuNCQwZDCkMOQxJDFkMa40ZDHkMiQyZDKkMuQzJDNkM6Qz5DQkNGQ0rjSkNOQ1JDVkNaQ15DYkNmQ2pDbkNyQ3ZDekN+Q4JDhkOKQ45DkkOWQ5pDnkOiQ6ZDqkOuQ7JDtkO6Q75DwkPGQ8pDzkPS407jUkPWQ9rjVkPeQ+JD5uNaQ+rjXkPuQ/JD9kP6RQbjYuNmRQrjakUO427jckUSRRZFGkUe43bjeuN+RSJFJuOCRSpFLkUy44ZFNkU6RT5FQkVGRUpFTuOK445FUuOS45bjmkVWRVpFXkViRWZFauOe46JFhkWK46ZFjkWSRZbjqkWaRZ5FokWmRapFrkWyRbZFukW+467jsuO2RcLjukXGRcpFzkXS475F1kXaRd5F4kXmRepGBkYKRg5GEkYWRhpGHkYiRiZGKkYuRjJGNkY6Rj5GQkZGRkpGTkZSRlbjwuPGRlrjyuPORl5GYkZm49JGauPWRm5GckZ2RnpGfuPa495GguPiRobj5kaKRo5GkkaWRppGnuPqRqJGpkaq4+5GrkayRrZGuka+RsJGxkbKRs5G0kbWRtpG3kbiRubj8uP2RupG7kbyRvZG+kb+RwJHBkcKRw5HEkcWRxpHHkciRyZHKkcuRzJHNkc6Rz5HQkdGR0pHTkdSR1ZHWkdeR2JHZkdqR27j+kdyR3ZHeuaGR35HgkeG5opHikeOR5JHlkeaR55Hokem5o5HquaSR67mlkeyR7ZHuke+R8JHxuaaR8pHzkfS5p5H1kfaR97mokfiR+ZH6kfuR/JH9kf6SQbmpkkK5qpJDkkSSRZJGkkeSSJJJkkq5q7msua2SS7mukkySTbmvubC5sbmykk6ST5JQklGSUrmzubSSU7m1klS5tpJVklaSV7m3kli5uLm5klmSWpJhubqSYpJjkmS5u5JlkmaSZ5JokmmSapJrkmy5vJJtub2SbpJvknCScZJyknOSdJJ1ub6SdpJ3kniSeZJ6koGSgpKDkoSShZKGkoeSiJKJkoqSi5KMko2SjpKPkpCSkZKSkpOSlJKVkpa5v5KXkpiSmbnAkpqSm5KcucGSnZKekp+SoJKhkqKSo5KkkqWSppKnkqiSqZKqkquSrJKtkq6Sr7nCkrCSsZKyucOSs5K0krW5xJK2kreSuJK5krqSu5K8ucWSvZK+ucaSv5LAksGSwpLDksSSxZLGuceSx5LIksm5yJLKksuSzLnJks2SzpLPktCS0ZLSktO5ypLUktW5y5LWkteS2JLZktqS25Lckt2S3pLfkuCS4ZLikuOS5JLlkuaS55LokumS6pLrkuyS7ZLuku+S8JLxkvKS85L0kvWS9pL3kviS+bnMuc2S+pL7uc6S/JL9uc+50JL+udGTQZNCk0OTRJNFudK505NGudS51bnWk0e515NIudiTSZNKudm52rnbudy53ZNLk0y53rnfueC54bnik02TTpNPk1C547nkk1G55ZNSueaTU5NUk1W555NWk1e56Lnpk1iTWbnqk1qTYZNiueuTY5Nkk2WTZpNnk2iTabnsue2Tarnuue+58JNrk2yTbbnxk26Tb7nyufOTcJNxufSTcpNzk3STdZN2k3eTeJN5k3qTgZOCk4O59ZOEk4WThpOHk4iTiZOKk4uTjJONk46Tj5OQk5GTkpOTk5STlZOWk5eTmJOZk5qTm5Ock52TnpOfk6CToZOik6OTpJOlk6aTp5Ook6m59rn3k6qTq7n4k6yTrbn5ufqTrrn7k6+TsJOxk7KTs7n8uf2TtLn+k7W6obqik7aTt5O4k7mTurqjuqSTu5O8uqWTvZO+uqa6p5O/k8CTwZPCk8OTxJPFuqi6qZPGuqq6q7qsk8eTyJPJk8qTy5PMuq26rpPNk866r5PPk9CT0bqwk9KT05PUk9WT1pPXk9iT2bqxk9q6srqzurST25Pck926tZPek9+6tpPgk+GT4rq3k+OT5JPlk+aT55Pok+mT6pPrk+yT7ZPuk++T8JPxk/KT85P0k/WT9pP3k/iT+bq4urm6upP6uruT+5P8k/26vJP+lEGUQpRDlESURZRGur26vpRHur+USLrAlEmUSpRLlEyUTZROusGUT5RQlFG6wpRSlFOUVJRVlFaUV5RYlFmUWpRhlGKUY5RklGWUZrrDlGeUaJRplGqUa5RslG26xJRulG+UcJRxlHKUc5R0lHWUdpR3lHiUeZR6lIGUgpSDlISUhZSGusWUh5SIlImUipSLlIyUjbrGuseUjpSPusiUkJSRlJK6yZSTlJSUlZSWlJeUmJSZusq6y5SalJuUnJSdlJ6Un5SglKGUopSjusyUpJSllKa6zZSnlKiUqZSqlKuUrJStlK6Ur5SwlLGUspSzlLSUtZS2lLeUuJS5lLqUu5S8lL26zrrPlL6Uv7rQlMCUwbrRutK607rUlMKUw5TElMWUxrrVutaUx7rXlMi62JTJlMqUy7rZutqUzLrblM2UzpTPlNCU0ZTSlNO63JTUlNWU1pTXlNiU2ZTalNuU3JTdlN663ZTflOCU4ZTilOOU5JTlut6U5pTnlOiU6ZTqlOuU7JTtlO6U75TwlPGU8pTzlPSU9ZT2lPeU+JT5lPqU+5T8lP2U/pVBlUK637rglUOVRLrhlUWVRpVHuuKVSJVJlUqVS5VMlU2VTpVPlVCVUZVSlVO645VUlVWVVpVXlViVWbrklVqVYZViuuWVY5VklWW65pVmlWeVaJVplWqVa5VsuueVbZVuuuiVb7rplXCVcZVylXOVdJV1uuq665V2lXe67JV4lXmVerrtlYGVgpWDlYSVhZWGlYe67rrvlYi68JWJlYqVi5WMlY2VjpWPlZCVkZWSlZOVlJWVlZaVl5WYlZmVmpWblZyVnZWelZ+VoJWhlaKVo5WklaWVppWnlaiVqZWqlauVrLrxuvKVrZWuuvOVr5WwlbG69JWyuvWVs5W0lbWVtpW3uva695W4uviVubr5uvq6+5W6lbuVvJW9uvy6/ZW+lb+6/pXAlcGVwruhlcO7opXElcWVxpXHlci7o7uklcm7pbumu6eVypXLlcyVzZXOu6i7qbuqlc+V0LurldGV0pXTu6yV1JXVldaV15XYldmV2rutu66V27uvu7C7sZXcld2V3pXfleCV4buyu7OV4pXjleSV5ZXmleeV6JXpleqV65Xsle2V7pXvu7SV8JXxlfKV85X0lfWV9pX3lfiV+ZX6lfuV/JX9lf6WQZZClkOWRJZFlkaWR5ZIlkmWSpZLlkyWTZZOlk+WUJZRllKWU5ZUllWWVpZXlli7tbu2llmWWru3lmGWYru4u7mWY5ZklmWWZpZnlmiWabu6lmqWa7u7u7y7vZZslm2WbpZvlnCWcbu+lnKWc5Z0lnWWdpZ3lniWeZZ6loGWgpaDloSWhZaGloeWiJaJloqWi7u/loyWjZaOlo+WkJaRu8C7wZaSlpOWlJaVlpaWl5aYlpmWmpablpyWnZaelp+7wrvDlqC7xLvFu8aWoZailqOWpJallqaWp5aolqmWqparlqyWrZaulq+WsJaxlrKWs5a0lrWWtpa3lriWuZa6lruWvJa9lr6Wv5bAlsGWwrvHu8iWw5bEu8mWxZbGlse7ypbIlsmWypbLlsyWzZbOu8u7zJbPltCW0bvNltKW05bUltWW1pbXltiW2ZbaltuW3Jbdlt6W35bgluGW4pbjluSW5ZbmlueW6JbpluqW65bslu2W7pbvlvCW8ZbylvOW9Jb1lvaW95b4lvmW+pb7lvyW/Zb+l0GXQpdDl0SXRZdGl0eXSJdJl0qXS5dMl02XTpdPl1CXUbvOl1KXU5dUl1WXVpdXl1iXWZdal2GXYpdjl2SXZZdml2eXaJdpl2qXa5dsl22Xbpdvl3CXcZdyu8+Xc5d0l3WXdpd3l3iXeZd6l4GXgpeDl4SXhZeGl4eXiJeJl4qXi5eMu9CXjZeOl4+XkJeRl5K70bvSl5OXlLvTl5WXlpeXu9SXmJeZl5qXm5ecl52XnrvVl5+XoLvWl6G715eil6OXpJell6aXp5eol6mXqperl6yXrZeul6+XsJexl7KXs5e0l7WXtpe3l7iXuZe6l7uXvJe9l76Xv5fAl8GXwpfDl8SXxZfGl8eXyJfJl8qXy5fMl82XzpfPl9CX0ZfSl9OX1JfVl9aX15fYl9mX2pfbl9yX3Zfel9+X4Jfhl+KX45fkl+WX5pfnl+iX6Zfql+uX7Jftl+6X75fwl/GX8pfzl/SX9Zf2l/eX+Jf5l/qX+7vYl/yX/Zf+mEGYQphDmESYRZhGmEeYSJhJmEqYS5hMmE2YTphPmFCYUbvZmFKYU5hUmFWYVphXu9qYWJhZmFq725hhmGKYY7vcmGSYZZhmmGeYaJhpmGq73bvemGuYbJhtmG6Yb5hwmHGYcphzmHSYdZh2mHeYeJh5mHqYgZiCmIOYhJiFmIaYh5iImImYipiLmIyYjZiOmI+YkJiRmJKYk5iUmJWYlrvfu+CYl5iYu+GYmZiamJu74picmJ2YnpifmKCYoZiiu+O75Jiju+WYpLvmmKWYppinmKiYqZiqu+e76Jiru+m76pismK2767vsu+277piumK+YsJixmLK777vwmLO78bvyu/OYtJi1mLa79Ji3mLi79bv2mLmYurv3mLuYvJi9u/iYvpi/mMCYwZjCmMOYxLv5u/qYxbv7u/y7/ZjGmMeYyJjJmMqYy7v+vKGYzJjNvKKYzpjPmNC8o5jRmNKY05jUmNWY1pjXvKS8pZjYvKaY2bynmNqY25jcmN2Y3pjfvKiY4JjhmOK8qZjjmOSY5byqmOaY55jomOmY6pjrmOy8q5jtmO6Y75jwvKyY8ZjymPOY9Jj1mPa8rbyuvK+8sLyxmPeY+LyyvLOY+by0vLWY+pj7mPyY/by2vLeY/ry4vLm8uplBmUKZQ5lEvLuZRby8vL2ZRplHvL6ZSJlJmUq8v5lLmUyZTZlOmU+ZUJlRvMC8wZlSvMK8w7zEmVOZVJlVmVaZV5lYvMW8xplZmVq8x5lhmWKZY7zImWSZZZlmmWeZaJlpmWq8ybzKmWu8y7zMvM2ZbJltmW6Zb5lwmXG8zplymXOZdLzPmXWZdpl3vNCZeJl5mXqZgZmCmYOZhJmFmYaZh5mImYm80ZmKmYuZjJmNmY6Zj7zSvNO81JmQvNWZkZmSmZO81pmUvNeZlZmWmZeZmJmZvNi82ZmavNqZm7zbmZyZnZmevNyZn5mgvN283pmhmaK835mjmaSZpbzgmaaZp5momamZqpmrmayZrZmuma+ZsJmxvOGZspmzmbSZtZm2mbe84pm4mbmZurzjmbuZvJm9vOSZvpm/mcCZwZnCmcOZxLzlmcWZxrzmvOeZx5nImcmZypnLmcyZzbzomc6Zz5nQvOmZ0ZnSmdO86pnUmdWZ1pnXmdiZ2ZnavOu87JnbvO2Z3Jndmd6Z35ngmeGZ4pnjvO6875nkmeW88JnmmeeZ6LzxmemZ6pnrmeyZ7Znume+88rzzmfC89JnxvPWZ8pnzmfSZ9Zn2mfe89rz3mfiZ+bz4mfqZ+7z5vPqZ/Jn9mf6aQZpCmkOaRLz7vPyaRbz9mka8/ppHvaGaSL2ivaOaSb2kmkqaS5pMmk2aTppPmlCaUZpSmlOaVJpVmlaaV5pYmlmaWpphmmK9pZpjmmSaZZpmmmeaaJppvaa9p5pqmmu9qJpsmm2abr2pmm+acJpxmnKac5p0mnW9qpp2mneaeJp5vauaepqBmoKag5qEmoW9rL2tmoaah72umoiaiZqKva+ai5qMmo2ajpqPmpCakb2wvbGakr2ympO9s5qUmpWalpqXmpiamb20vbWampqbmpyanZqemp+9tpqgmqGaopqjmqSapZqmvbeap5qovbiaqb25mqqaq5qsmq2arpqvvbq9u5qwmrG9vJqymrOatL29vb6atZq2mreauJq5mrq9v73Amru9wZq8vcKavZq+mr+awJrBmsKaw5rEmsWaxprHmsiayZrKmsuazJrNms6az5rQmtGa0prTmtSa1ZrWmtea2JrZmtqa25rcmt2a3r3DvcSa35rgvcWa4Zrivca9x5rjmuSa5Zrmmuea6L3Ivcm9yprpvcua6r3Mmuua7Jrtmu69zZrvvc69z5rwvdC90ZrxmvKa873SmvSa9Zr2mvea+Jr5mvq9073Umvua/L3Vvdaa/Zr+m0GbQptDvde92L3Zm0SbRb3am0abR5tIvdubSZtKm0ubTJtNm06bT73cvd2bUJtRvd6935tSm1ObVJtVm1abV5tYm1mbWpthm2KbY5tkm2WbZptnm2ibaZtqm2ubbJttm26bb5twm3Gbcr3gm3ObdJt1m3abd5t4m3mbepuBm4Kbg5uEm4WbhpuHm4ibiZuKm4ubjJuNm46bj5uQm5GbkpuTm5SblZuWm5ebmJuZm5q94b3im5ubnL3jm52bnpufveSboL3lm6Gbopujm6Sbpb3mveebppunvei96Zuom6mbqpurm6ybrb3qm66br5uwveubsZuym7O97Ju0m7Wbtpu3m7ibuZu6m7ubvJu9m76bv5vAm8GbwpvDm8SbxZvGm8ebyJvJm8qby5vMm82bzpvPm9Cb0ZvSm9Ob1JvVm9ab15vYm9mb2pvbm9yb3Zvem9+b4Jvhm+Kb45vkm+Wb5r3tm+eb6Jvpm+qb65vsm+2b7pvvm/Cb8Zvym/Ob9Jv1m/ab95v4m/mb+pv7m/yb/b3uve+b/pxBvfCcQpxDvfG98pxEvfOcRZxGnEecSJxJvfS99ZxKnEucTL32nE2cTpxPnFCcUZxSvfe9+JxTnFS9+ZxVnFacV5xYnFmcWpxhnGKcY5xknGWcZpxnnGicab36nGqca5xsnG2cbpxvnHC9+5xxnHKcc5x0nHWcdpx3nHiceZx6nIGcgpyDnISchZyGnIeciJyJvfycipyLnIycjZyOnI+ckL39nJGckpyTvf6clJyVnJa+oZyXnJicmZyanJucnJydvqK+o5yenJ+coJyhnKKco5yknKWcppynvqScqJypnKqcq5ysnK2crpyvnLCcsZyynLOctJy1nLact5y4nLmcupy7nLycvZy+nL+cwJzBnMK+pb6mnMOcxL6nnMWcxpzHvqicyJzJnMqcy5zMnM2czr6pvqqcz5zQnNG+q5zSnNOc1JzVnNac176snNic2ZzanNuc3JzdnN6c35zgnOGc4pzjnOSc5ZzmnOec6JzpnOq+rZzrnOyc7ZzunO+c8Jzxvq6c8pzznPSc9Zz2nPec+Jz5nPqc+5z8nP2c/p1BnUKdQ51EnUWdRp1HnUidSZ1KnUudTJ1NnU6+r51PnVCdUb6wnVKdU51UnVWdVp1XnVidWZ1anWGdYp1jnWSdZZ1mnWedaJ1pnWqda51snW2dbp1vnXCdcZ1ynXOddJ11nXadd514nXmdep2BnYKdg52EnYWdhp2HnYidib6xnYqdi52MnY2djp2PvrK+s52QnZG+tJ2SnZOdlL61nZW+tp2WnZedmJ2Zvre+uL65nZqdm52cnZ2dnp2fnaCdoZ2inaO+up2knaWdpr67naedqJ2pvrydqp2rnaydrZ2una+dsL69nbGdsp2znbSdtZ22nbeduJ25nbqdu76+vr+dvJ29vsCdvp2/ncC+wZ3BncKdw53EncWdxp3HvsK+w53IvsSdyb7Fncqdy53Mnc2dzp3Pvsa+x53QndG+yL7Jvsqd0r7Lvsy+zZ3TndSd1Z3Wvs6+z77Qnde+0b7SvtOd2J3Zndq+1L7Vndu+1r7Xndyd3b7Ynd6d353gvtmd4Z3ineOd5J3lnead577avtud6L7cvt2+3p3pneqd653sne2d7r7fvuCd753wvuGd8Z3ynfO+4p30nfW+4532nfed+J35vuS+5Z36vuad+77nnfyd/Z3+vuieQb7pvuqeQp5DnkS+655FnkaeR77snkieSZ5KnkueTJ5Nnk6eT77tnlCeUZ5SnlOeVJ5VnlaeV55Ynlm+7r7vnlqeYb7wvvGeYr7yvvO+9L71nmOeZJ5lnmaeZ772vve++L75vvq++778nmi+/Z5pvv6ear+hv6Kea55sv6OebZ5unm+/pJ5wnnGecp5znnSedZ52v6W/pp53v6eeeL+onnmeep6BnoKeg56Ev6m/qr+rnoW/rJ6GnoeeiL+tnom/rr+vnoqei56Mno2/sL+xv7K/s7+0v7Wejp6PnpC/tr+3v7i/uZ6RnpKek7+6npSelZ6Wv7uel56Ynpmemp6bnpyenb+8v72enr++v7+en56gnqGeop6jnqSepb/Av8Gepp6nv8KeqJ6pnqq/w7/Ev8Weq7/Gnqyerb/Hv8i/yZ6uv8qer7/LnrC/zJ6xnrKes560v82/zp61nra/z563nrieub/Qnrqeu568nr2evp6/nsC/0b/SnsG/07/Uv9Wewp7DnsSexZ7Gnse/1r/Xnsieyb/Ynsqey57Mns2ezp7PntCe0Z7SntOe1L/ZntWe1r/ante/257Yntme2p7bntye3b/cv92e3p7fv96e4J7hnuK/357jnuSe5Z7mnuee6J7pv+C/4Z7qv+Ke67/jnuye7Z7unu+e8J7xv+S/5Z7ynvO/5p70nvWe9r/nnvee+J75nvqe+578nv2/6L/pnv6/6p9Bv+ufQp9Dn0SfRZ9Gn0e/7L/tn0ifSb/un0qfS59Mv++/8L/xn02fTp9Pn1CfUb/yv/OfUr/0n1O/9Z9Un1WfVp9Xn1ifWb/2v/efWp9hv/ifYp9jn2S/+Z9ln2afZ59on2mfap9rv/q/+59sn22//L/9n26fb59wn3Gfcp9zv/7AoZ90n3XAop92n3efeMCjn3mfep+Bn4Kfg5+En4XApMCln4afh5+IwKafiZ+Kn4ufjJ+Nn47Ap8Con4+fkMCpn5Gfkp+TwKqflJ+Vn5afl5+Yn5mfmsCrwKyfm8Ctn5zArp+dn56fn5+gn6GfosCvwLCfo5+kwLGfpZ+mn6fAsp+on6mfqp+rn6yfrZ+uwLPAtJ+vwLWfsMC2n7HAt5+yn7OftJ+1wLjAuZ+2n7fAup+4n7mfusC7n7ufvJ+9n76fv8C8n8DAvcC+n8HAv5/CwMDAwcDCwMPAxMDFwMbAx5/Dn8SfxcDIn8afx5/IwMmfyZ/Kn8ufzJ/Nn86fz8DKn9Cf0cDLn9Kf05/Un9Wf1p/Xn9if2cDMwM2f2p/bwM6f3J/dn97Az8DQwNGf35/gn+Gf4sDSwNPA1J/jwNXA1sDXwNif5J/ln+bA2Z/nwNrA25/on+nA3J/qwN3A3sDfn+vA4J/sn+2f7p/vn/DA4cDin/HA48DkwOXA5p/yn/Of9J/1n/bA58Don/ef+MDpn/mf+p/7wOqf/J/9n/6gQaBCoEOgRMDrwOygRcDtwO7A76BGoEegSKBJoEqgS8DwwPGgTKBNwPKgTsDzoE/A9KBQoFGgUqBToFSgVaBWwPWgV6BYoFmgWsD2oGGgYqBjoGSgZaBmwPegZ6BooGnA+KBqoGugbMD5oG2gbqBvoHCgcaByoHOgdKB1oHagd6B4oHmgeqCBoIKgg6CEoIXA+sD7oIagh8D8oIigiaCKwP2gi8D+oIygjaCOoI+gkMGhwaKgkcGjoJLBpMGloJOglKCVoJagl8GmwaegmKCZwaigmqCboJzBqaCdoJ6gn6CgoKGgoqCjwarBq6CkwaygpcGtoKagp6CooKmgqqCrwa6grKCtoK7Br6CvoLCgscGwoLKgs6C0oLWgtqC3oLjBscGyoLmgusGzwbSgu6C8oL2gvqC/oMDBtaDBoMKgw6DEoMWgxqDHoMigyaDKoMugzKDNoM6gz6DQoNGg0qDToNSg1aDWoNeg2KDZoNqg28G2wbeg3KDdwbig3qDfoODBuaDhwbqg4qDjoOSg5aDmwbvBvKDnwb2g6MG+wb/BwKDpoOqg68HBwcLBw6DsoO2g7qDvoPCg8cHEoPKg86D0oPWg9qD3oPig+cHFoPrBxqD7wceg/KD9oP6hQaFCoUPByKFEoUWhRqFHoUihSaFKoUuhTKFNoU6hT6FQoVGhUqFToVShVaFWwcnByqFXoVihWaFaoWGhYsHLoWOhZKFlwcyhZqFnoWjBzaFpoWqha6FsoW2hbqFvwc7Bz6FwwdChccHRoXKhc6F0oXWhdqF3wdLB06F4oXnB1KF6oYGhgqGDoYShhaGGoYehiKGJoYqhi6GMoY2hjqGPwdWhkKGRoZKhk6GUoZXB1sHXoZahl8HYoZihmaGawdnB2sHboZuhnKGdoZ6hn8Hcwd2hoMHeokHB36JCokOiRKJFokaiR8HgokiiSaJKokuiTKJNok6iT6JQolGiUqJTolSiVaJWoleiWKJZolrB4aJhomKiY6JkomWiZqJnweKiaKJpomqia6Jsom2ibqJvonCicaJyonOidKJ1onaid6J4onmieqKBooKig6KEooWihqKHoojB48HkoomiisHloouijKKNweaijqKPopCikaKSopOilMHnweiilcHpopail6KYopmimqKbopyincHqop6in6KgweujQaNCo0PB7KNEo0WjRqNHo0ijSaNKwe2jS6NMo02jTqNPo1CjUaNSo1OjVKNVwe7B76NWo1fB8KNYo1mjWsHxo2GjYqNjo2SjZaNmo2fB8sHzo2jB9KNpwfWjaqNro2yjbaNuo2+jcKNxo3Kjc6N0o3WjdqN3o3ijeaN6o4GjgqODo4SjhaOGo4ejiKOJo4qji6OMo42jjqOPo5CjkcH2wfejkqOTwfijlKOVwfnB+qOWwfujl6OYo5mjmqObwfzB/aOcwf6jncKhwqKjnqOfwqPCpKOgwqXCpqRBpELCp6RDwqikRMKppEWkRsKqpEekSKRJpErCq8KspEvCrcKuwq+kTKRNpE6kT6RQpFHCsMKxpFKkU8KypFSkVaRWwrOkV6RYpFmkWqRhpGKkY8K0wrWkZMK2wrfCuKRlpGakZ6RopGmkasK5pGukbKRtwrqkbqRvpHCkcaRypHOkdKR1pHakd6R4pHmkeqSBpIKkg8K7pISkhaSGpIekiKSJpIqki6SMpI2kjqSPpJCkkaSSpJOklKSVpJakl6SYpJmkmqSbpJyknaSepJ+koKVBpUKlQ6VEpUXCvMK9pUalR8K+pUilSaVKwr+lS6VMpU2lTqVPpVClUcLAwsGlUsLCwsPCxKVTpVSlVaVWpVelWMLFpVmlWqVhpWKlY6VkpWWlZqVnpWilaaVqpWulbKVtpW6lb6VwpXGlcsLGpXOldKV1pXald6V4wseleaV6pYGlgqWDpYSlhaWGpYeliKWJpYqli6WMpY2ljqWPpZClkcLIpZKlk6WUpZWllqWXpZilmaWapZulnKWdpZ6ln6WgpkGmQqZDpkSmRaZGpkemSKZJpkqmS6ZMpk2mTqZPplCmUaZSplOmVMLJwsqmVaZWwsumV6ZYplnCzKZapmGmYqZjpmSmZaZmws3CzqZnws+maMLQpmnC0aZqpmumbKZtwtLC06Zupm+mcKZxpnKmc8LUpnSmdaZ2pnemeKZ5pnqmgaaCpoOmhMLVpoWmhqaHpoimiaaKpovC1qaMpo2mjqaPppCmkaaSppOmlKaVppaml6aYppmmmqabppymnaaewtemn6agp0GnQqdDp0SnRcLYp0anR6dIwtmnSadKp0vC2qdMp02nTqdPp1CnUadSwtvC3KdTp1SnVadWp1enWKdZp1qnYadip2OnZKdlp2anZ6dop2mnaqdrp2ynbadup2+ncKdxp3Knc6d0p3Wndqd3wt2neKd5p3qngaeCp4PC3sLfp4SnhcLgp4anh6eIwuGniaeKp4unjKeNp46nj8LiwuOnkKeRp5LC5KeTp5SnlaeWp5enmMLlp5mnmqebp5ynnaeep5+noKhBqEKoQ6hEqEWoRqhHqEioSahKqEvC5sLnqEyoTahOqE+oUKhRqFKoU6hUqFWoVqhXqFioWahaqGGoYqhjqGSoZahmqGeoaKhpqGqoa6hsqG2obqhvqHCocahyqHPC6Kh0qHWodqh3qHioeah6qIGogqiDqISohaiGqIeoiKiJqIqoi6iMqI2ojqiPqJCokaiSqJOolMLpqJWolqiXqJiomaiaqJuonKidqJ6on6igqUGpQqlDqUSpRalGqUepSKlJqUqpS6lMqU2pTqlPwuqpUKlRqVKpU6lUqVWpVqlXqVipWalaqWGpYqljqWTC66llqWbC7Klnwu2paKlpqWqpa6lsqW2pbqlvqXCpcalyqXOpdKl1qXapd6l4qXmpeqmBqYKpg6mEqYWphqmHqYipiamKqYupjKmNqY6pj8Luwu+pkKmRwvCpkqmTqZTC8amVqZapl6mYqZmpmqmbwvLC86mcqZ2pnsL0wvWpn6mgqkGqQsL2wvfC+KpDqkTC+apFwvqqRsL7qkeqSKpJqkqqS6pMqk3C/ML9qk7C/sOhw6LDo6pPqlCqUapSqlPDpMOlqlSqVcOmqlaqV6pYw6eqWapaqmGqYqpjqmSqZcOow6mqZsOqw6vDrKpnqmiqaapqqmuqbMOtqm2qbqpvw66qcMOvqnHDsKpyqnOqdKp1qnaqd6p4w7Gqeap6qoGqgsOyqoOqhKqFqoaqh6qIqomqiqqLqoyqjaqOqo+qkKqRqpKqk6qUqpWqlqqXqpiqmaqaqpuqnKqdqp6qn6qgq0GrQqtDq0TDs8O0q0WrRsO1q0erSKtJw7arSqtLq0yrTatOq0+rUMO3w7irUcO5w7rDu6tSq1OrVKtVq1arV8O8w72rWKtZw76rWqthq2LDv6tjq2SrZatmq2eraKtpw8DDwatqw8Kra8PDq2yrbatuq2+rcKtxw8Srcqtzq3TDxat1q3ard6t4q3mrequBq4Krg6uEq4WrhquHq4iricPGq4qri6uMq42rjquPq5DDx6uRq5Krk8PIq5SrlauWq5ermKuZq5qrm6ucq52rnqufq6CsQaxCrEPDyaxErEWsRqxHrEisScPKw8usSqxLw8ysTKxNrE7DzaxPrFCsUaxSrFOsVKxVw87Dz6xWw9CsV8PRrFisWaxarGGsYqxjw9KsZKxlrGbD06xnrGisacPUrGqsa6xsrG2sbqxvrHCscaxyrHOsdKx1w9Wsdqx3rHiseax6rIGsgqyDrISshayGrIesiKyJrIqsi6yMrI2sjqyPrJCskaySrJOslKyVrJasl6yYrJmsmqybrJysncPWrJ6sn6ygw9etQa1CrUPD2K1ErUWtRq1HrUitSa1Kw9nD2q1Lw9utTMPcrU2tTq1PrVCtUa1Sw92tU61UrVWtVq1XrVitWa1arWGtYq1jrWStZa1mrWfD3q1orWmtaq1rrWytba1urW+tcK1xrXLD38PgrXOtdMPhrXWtdq13w+KteK15rXqtga2CrYOthMPjw+SthcPlrYbD5q2HrYitia2KrYutjMPnrY2tjq2PrZCtka2SrZOtlK2VrZatl62YrZmtmq2brZytna2erZ/D6K2grkGuQq5DrkSuRa5Gw+muR65IrknD6q5KrkuuTK5Nrk6uT65QrlGuUq5TrlSuVa5WrleuWK5ZrlquYa5irmOuZK5lrmbD665nrmiuacPsrmqua65sw+2uba5urm+ucK5xrnKuc8Puw++udMPwrnXD8a52rneueK55rnqugcPyroKug66Ew/Ouha6GrofD9K6Iromuiq6Lroyuja6Ow/Wuj66QrpGuksP2rpOulK6Vrpaul66Yw/fD+K6ZrprD+a6brpyuncP6rp6un66gr0GvQq9Dr0TD+8P8r0XD/a9Gw/6vR69Ir0mvSq9Lr0yvTa9Or0+vUK9Rr1KvU69Ur1WvVq9Xr1ivWa9ar2GvYq9jr2SvZa9mr2evaK9pr2qva69sr22vbsShxKKvb69wxKOvca9yxKTEpcSmr3OvdK91r3avd694xKfEqK95xKmvesSqr4Gvgq+Dr4Svha+GxKvErK+Hr4jEra+Jr4qvi8Sur4yvja+Or4+vkK+Rr5LEr8Swr5PEsa+UxLKvla+Wr5evmK+Zr5rEs8S0r5uvnMS1r52vnq+fxLavoLBBsEKwQ7BEsEWwRsS3xLiwR8S5xLrEu7BIsEmwSrBLsEywTcS8xL2wTrBPsFCwUbBSsFOwVLBVsFawV7BYsFmwWrBhsGKwY7BksGWwZsS+sGewaLBpsGqwa7BssG2wbrBvsHCwcbBysHOwdLB1sHawd7B4sHmwerCBsIKwg7CEsIWwhrCHsIiwibCKsIuwjLCNsI7Ev8TAsI+wkMTBsJGwksTCxMOwk7CUsJWwlrCXsJiwmcTExMWwmsTGxMfEyLCbsJywnbCesJ+woMTJxMqxQbFCxMuxQ7FEsUXEzLFGsUexSLFJsUqxS7FMxM3EzrFNxM+xTsTQsU+xULFRsVKxU7FUxNGxVbFWsVfE0rFYsVmxWsTTsWGxYrFjsWSxZbFmsWfE1MTVsWjE1sTXxNixabFqsWuxbLFtsW7E2bFvsXCxcbFysXOxdLF1sXaxd7F4sXmxerGBsYKxg7GEsYWxhrGHsYixibGKsYuxjLGNsY6xj8TaxNuxkLGRxNyxkrGTsZTE3bGVsZaxl7GYsZmxmrGbxN7E37GcxOCxncThsZ6xn7GgskGyQrJDxOLE47JEskXE5LJGskeySMTlskmySrJLskyyTbJOsk/E5rJQslGyUrJTxOeyVLJVslayV7JYslnE6LJasmGyYrJjsmSyZbJmsmeyaLJpsmqya7Jssm2ybrJvsnCycbJysnPE6bJ0snWydrJ3sniyecTqsnqygbKCsoOyhLKFsobE67KHsoiyibKKsouyjLKNso6yj7KQspGykrKTspSylbKWspeymLKZxOyymrKbspyynbKesp+yoLNBs0KzQ7NEs0WzRrNHs0izSbNKs0uzTLNNs06zT7NQs1GzUrNTs1TE7cTus1WzVsTvs1ezWLNZxPCzWrNhs2KzY7Nks2WzZsTxxPKzZ8Tzs2jE9LNps2qza7Nss22zbsT1s2+zcLNxxPazcrNzs3TE97N1s3azd7N4s3mzerOBs4Kzg7OEs4WzhsT4s4eziLOJs4qzi7OMxPmzjbOOs4+zkLORs5Kzk7OUs5WzlrOXs5izmbOas5uznLOds56zn7OgxPq0QbRCtEO0RLRFtEbE+8T8tEe0SMT9tEm0SrRLxP60TLRNtE60T7RQtFG0UsWhxaK0U8WjtFTFpLRVtFa0V7RYtFm0WsWltGG0YrRjxaa0ZLRltGbFp7RntGi0abRqtGu0bLRtxai0brRvtHC0cbRytHO0dLR1tHa0d7R4xanFqrR5tHrFq7SBtIK0g8WstIS0hbSGtIe0iLSJtIrFrcWutIu0jLSNxa+0jrSPtJC0kbSStJO0lLSVtJa0l7SYtJm0mrSbtJy0nbSetJ+0oLVBtUK1Q7VEtUW1RrVHtUi1SbVKtUu1TLVNtU61T8WwxbG1ULVRxbK1UrVTtVTFs7VVtVa1V7VYtVm1WrVhxbTFtbVitba1Y8W3tWS1ZbVmtWe1aLVpxbjFubVqtWvFurVstW21bsW7xby1b7VwtXG1crVztXTFvcW+tXXFv8XAxcG1drV3tXi1ebV6tYHFwsXDtYK1g8XEtYS1hbWGxcW1h7WItYm1irWLtYy1jcXGxce1jsXIxcnFyrWPtZC1kbWStZO1lMXLtZW1lrWXtZi1mbWatZu1nLWdtZ61n7WgtkG2QrZDtkS2RbZGtke2SMXMtkm2SrZLtky2TbZOtk+2ULZRtlK2U7ZUtlW2VrZXtli2WbZatmG2YrZjtmS2ZbZmtme2aLZptmq2a7Zstm22brZvtnDFzcXOtnG2csXPtnO2dLZ1xdC2dsXRtne2eLZ5tnq2gcXSxdO2gsXUxdXF1raDtoS2hbaGtoe2iMXXxdi2ibaKxdm2i7aMto3F2raOto+2kLaRtpK2k7aUxdvF3LaVxd22lsXetpe2mLaZtpq2m7acxd+2nbaetp/F4Lagt0G3QrdDt0S3RbdGt0e3SLdJt0q3S7dMt023TsXht0+3ULdRt1K3U7dUt1XF4rdWt1e3WMXjt1m3Wrdht2K3Y7dkt2W3Zrdnt2i3abdqt2u3bLdtt263b7dwt3G3crdzt3S3dcXkxeW3drd3xea3eLd5t3rF57eBt4K3g7eEt4W3hreHxejF6beIxeq3icXrt4q3i7eMt43F7LeOxe23j7eQt5HF7reSt5O3lLeVt5a3l7eYt5m3mrebt5y3nbeet5+3oLhBuEK4Q7hEuEW4RrhHuEjF77hJuEq4S7hMuE24TrhPuFC4UbhSuFO4VLhVuFa4V7hYuFm4WrhhuGK4Y7hkuGW4ZrhnuGi4acXwuGq4a7hsxfG4bbhuuG+4cLhxuHK4c7h0uHW4drh3uHi4ebh6xfK4gcXzuIK4g7iEuIW4hriHxfS4iLiJuIq4i7iMuI24jriPuJC4kbiSuJO4lLiVuJa4l7iYuJm4mribuJy4nbieuJ+4oLlBuULF9cX2uUO5RMX3uUW5RrlHxfi5SLlJuUq5S7lMuU25TsX5xfq5T8X7uVDF/LlRuVK5U7lUuVW5VsX9uVe5WLlZuVq5YbliuWO5ZLlluWa5Z7louWm5arlruWy5bbluuW/F/rlwuXG5crlzuXS5dbl2xqG5d7l4uXm5ermBuYK5g7mEuYW5hrmHuYi5ibmKuYu5jLmNuY65j7mQuZG5krmTuZS5lbmWuZfGosajuZi5mcakuZq5m7mcxqW5nbmeuZ+5oLpBukK6Q8amxqe6RLpFukbGqLpHuki6SbpKuku6TMapuk26TrpPxqq6ULpRulLGq7pTulS6VbpWule6WLpZxqy6WrphumK6Y8atumS6Zbpmume6aLppxq7Gr7pqumvGsLpsum3Gscayum7Gs7pvunC6cbpyunPGtMa1unTGtrp1una6d7p4unm6erqBuoLGt7qDuoS6hca4uoa6h7qIxrm6ibqKuou6jLqNuo66j8a6xru6kLqRupK6k7qUupW6lrqXupi6mca8xr26mrqbxr66nLqdup7Gv7qfuqC7QbtCu0O7RLtFxsDGwbtGxsK7R8bDu0i7SbtKu0u7TLtNxsTGxcbGu07Gx7tPu1C7UcbIu1LGybtTu1S7VbtWu1fGysbLu1jGzMbNxs67Wbtau2HGz7tiu2PG0MbRu2S7ZcbSu2a7Z7toxtO7abtqu2u7bLttu267b8bUxtW7cMbWxtfG2Ltxu3K7c7t0u3W7dsbZxtq7d7t4u3m7eruBu4K7g7uEu4W7hruHu4i7ibuKu4u7jLuNu467j7uQu5G7kruTu5S7lbuWu5e7mLuZu5q7m7ucu527nrufu6C8QbxCvEO8RLxFvEa8R7xIvEm8SrxLvEy8TbxOvE+8ULxRvFLG28bcvFO8VMbdvFW8VrxXxt68WLxZvFq8YbxivGO8ZMbfxuC8ZcbhxuLG47xmvGe8aLxpvGq8a8bkxuW8bLxtxua8brxvvHDG57xxvHK8c7x0vHW8drx3xujG6bx4xuq8ecbrvHq8gbyCvIO8hLyFxuy8hryHvIjG7byJvIq8i8buvIy8jbyOvI+8kLyRvJLG78bwvJO8lMbxxvK8lbyWvJe8mLyZvJrG87ybvJy8nbyevJ+8oL1BxvS9Qr1DvUS9Rb1GvUe9SL1JxvW9Ssb2vUu9TL1NvU69T71QvVG9Usb3xvi9U71Uxvm9Vb1WvVfG+r1YvVm9Wr1hvWK9Y71kxvvG/L1lxv29Zsb+vWe9aL1pvWq9a71sx6G9bb1uvW+9cL1xvXK9c710vXW9dr13vXi9eb16vYG9gr2DvYS9hb2Gx6K9h72IvYm9ir2LvYy9jb2OvY+9kL2RvZK9k72UvZW9lr2XvZi9mb2avZu9nL2dvZ69n72gvkG+Qr5DvkS+Rb5Gvke+SMejvkm+Sr5Lx6S+TL5Nvk6+T75QvlG+Ur5TvlS+Vb5Wvle+WL5Zvlq+Yb5ivmO+ZL5lvma+Z75ox6W+ab5qvmvHpr5svm2+bsenvm++cL5xvnK+c750vnW+dseovnfHqb54vnm+er6BvoK+g76EvoXHqervoa+h8esvoi+icetx66+isevvou+jL6Nvo6+j8ewx7G+kMeyvpHHs76SvpO+lL6Vvpa+l8e0vpi+mb6avpu+nL6dvp6+n76gv0G/Qr9Dv0S/Rb9Gv0e/SL9Jv0q/S8e1v0y/Tb9Ov0+/UL9Rv1K/U79Uv1W/Vr9Xv1i/Wb9av2G/Yr9jv2S/Zb9mv2e/aL9pv2q/a79sv22/br9vv3C/cb9yv3PHtr90v3W/dse3v3e/eL95x7i/er+Bv4K/g7+Ev4W/hse5v4e/iMe6v4m/ir+Lv4y/jb+Ov4+/kMe7v5G/kr+Tx7y/lL+Vv5bHvb+Xv5i/mb+av5u/nL+dx76/nr+fx7+/oMfAwEHAQsBDwETARcBGx8HAR8BIwEnHwsBKwEvATMfDwE3ATsBPwFDAUcBSwFPHxMfFwFTHxsBVwFbAV8BYwFnAWsBhwGLAY8BkwGXAZsBnwGjAacBqwGvAbMBtwG7Ab8BwwHHAcsBzwHTAdcB2wHfAeMB5wHrAgcCCwIPAhMfHx8jAhcCGx8nAh8CIwInHysCKwIvAjMCNwI7Aj8CQx8vHzMCRx83AksfOwJPAlMCVwJbAl8CYx8/H0MCZwJrH0cCbwJzAncfSwJ7An8CgwUHH08FCwUPH1MfVwUTH1sFFx9fBRsFHwUjBScFKwUvH2MfZwUzBTcfawU7BT8FQx9vBUcFSwVPBVMFVwVbBV8fcx93BWMfex9/H4MFZwVrBYcFiwWPBZMfhwWXBZsFnwWjBacFqwWvBbMFtwW7Bb8FwwXHBcsFzwXTBdcF2wXfBeMfiwXnBesGBwYLBg8GEwYXBhsGHwYjBicGKwYvBjMGNwY7Bj8GQwZHBksGTwZTBlcGWwZfBmMGZwZrBm8GcwZ3BnsGfwaDH48fkwkHCQsflwkPCRMJFx+bCRsfnwkfCSMJJwkrCS8fox+nCTMfqwk3H68JOwk/CUMJRwlLCU8fsx+3CVMJVx+7CVsJXwljH78JZwlrCYcJiwmPCZMJlx/DH8cJmx/LCZ8fzwmjCacJqwmvCbMJtx/TH9cJuwm/H9sJwwnHCcsf3wnPCdMJ1wnbCd8J4wnnH+Mf5wnrH+sf7x/zCgcKCwoPChMKFwobH/cKHwojCicf+worCi8KMyKHCjcKOwo/CkMKRwpLCk8KUyKLClcKWwpfCmMKZwprCm8Kcwp3CnsijyKTCn8KgyKXDQcNCw0PIpsNEw0XDRsNHyKfDSMNJyKjIqcNKyKrDS8irw0zDTcNOyKzDT8NQyK3IrsNRw1LIr8NTw1TDVciww1bDV8NYw1nDWsNhw2LDY8Nkw2XIscNmyLLDZ8Now2nDasNrw2zIs8i0w23Dbsi1w2/DcMNxw3LDc8N0w3XDdsN3w3jDecN6w4HDgsi2w4PIt8OEw4XDhsOHw4jDici4yLnDisOLyLrDjMONw47Iu8OPw5DDkcOSw5PDlMOVw5bIvMOXyL3DmMi+w5nDmsObw5zDncOeyL/Dn8OgxEHIwMRCxEPERMjBxEXERsRHxEjEScRKxEvETMjCxE3Iw8ROxE/EUMRRxFLEU8RUxFXIxMjFxFbEV8jGxFjEWcRayMfEYcRixGPEZMjIxGXEZsjJxGfEaMjKxGnIy8RqxGvEbMRtxG7Eb8jMxHDEccRyyM3Ec8R0xHXIzsR2xHfEeMR5xHrEgcSCyM/Eg8SExIXEhsjQxIfEiMSJxIrEi8SMyNHI0sSNxI7I08SPxJDEkcjUxJLEk8SUxJXElsSXxJjEmcSaxJvEnMSdyNXEnsSfxKDFQcVCxUPI1sjXxUTFRcjYxUbFR8VIyNnFScVKxUvFTMVNxU7FT8jayNvFUMjcxVHI3cVSxVPFVMVVxVbFV8jeyN/FWMVZyODFWsVhxWLI4cVjxWTFZcVmxWfFaMVpyOLFasVryOPFbMjkxW3FbsVvxXDFccVyyOXI5sVzxXTI58V1yOjI6cjqyOvFdsV3xXjFecV6xYHI7MjtxYLI7sWDyO/FhMWFxYbI8MWHxYjI8cWJxYrFi8jyxYzFjcWOyPPFj8WQxZHFksWTxZTFlcj0yPXFlsWXxZjI9sWZxZrFm8WcxZ3Fnsj3yPjFn8WgyPnGQcZCxkPI+sZExkXGRsZHxkjGScZKyPvI/MZLyP3GTMj+xk3GTsZPxlDGUcZS";
     let _hangulTable = null;
     function getHangulTable() {
       if (!_hangulTable) {
@@ -1278,20 +1627,7 @@
     }
 
     // 품목 라벨 출력: 품명 + 실물 스캔 가능한 CODE128 바코드(GS k)
-    // buildBarcodeBytes/printSegments는 이미 구현되어 있었지만 화면 어디에서도
-    // 호출되지 않고 있었음 — 관리 화면의 "라벨" 버튼과 연결한다.
-    async function printLabel(product) {
-      if (!product.barcode) {
-        alert('이 품목에는 바코드가 등록되어 있지 않습니다.');
-        return;
-      }
-      await printSegments([
-        { type: 'text', text: DIV25 + '\n' },
-        { type: 'text', text: center(product.name, 25) + '\n\n' },
-        { type: 'barcode', code: product.barcode },
-        { type: 'text', text: '\n' + DIV25 + '\n\n\n' }
-      ]);
-    }
+    // (라벨 출력 기능은 사용하지 않기로 하여 제거됨 — 필요해지면 printSegments/buildBarcodeBytes로 재구현)
 
     /* =========================================================
        4-1. 바코드 스캔 & 파싱 (GS1-128 / 일반 EAN 지원)
@@ -1368,7 +1704,35 @@
         return;
       }
 
-      const product = DB.products.find(p => p.barcode && normalizeGtin(p.barcode) === normalizeGtin(gtin));
+      // 매 스캔마다 서버(scan API)를 호출해 최신 제품 기준 + 현재 재고를 조회한다.
+      // 서버 응답이 있으면 그 값으로 로컬 product를 갱신/보강하고, 실패하면 로컬 캐시로 대체한다.
+      const scanResult = await SheetSync.scanBarcode(gtin);
+      let product = DB.products.find(p => p.barcode && normalizeGtin(p.barcode) === normalizeGtin(gtin));
+
+      if (scanResult && scanResult.success && scanResult.product) {
+        const sp = scanResult.product; // MASTER_PRODUCTS 행: barcode/productName/category/storage/ruleType/days
+        if (product) {
+          Object.assign(product, {
+            name: sp.productName ?? product.name,
+            category: sp.category ?? product.category,
+            storageMethod: sp.storage ?? product.storageMethod,
+            basis: sp.ruleType ? ruleTypeToBasis(sp.ruleType) : product.basis,
+            durationValue: sp.days != null ? Number(sp.days) : product.durationValue,
+            durationUnit: 'day',
+            containerCycleDays: sp.containerCycleDays != null ? Number(sp.containerCycleDays) : product.containerCycleDays,
+          });
+        } else {
+          // 서버는 알고 있지만 로컬에는 없는 품목 → 최소 정보로 로컬에 생성
+          const currentZone = (ZONES.find(z => location.hash.includes('zone/' + z.key)) || ZONES[0]).key;
+          product = {
+            id: uid(), zone: currentZone, category: sp.category || '기타', name: sp.productName || gtin,
+            basis: ruleTypeToBasis(sp.ruleType), durationValue: Number(sp.days) || 0,
+            durationUnit: 'day', storageMethod: sp.storage || null, barcode: gtin, order: DB.products.length,
+            containerCycleDays: Number(sp.containerCycleDays) || DEFAULT_CONTAINER_CYCLE_DAYS
+          };
+          DB.products.push(product);
+        }
+      }
 
       if (!product) {
         if (confirm(`등록되지 않은 바코드입니다.\n(${gtin})\n\n새 품목으로 등록하시겠습니까?`)) {
@@ -1381,6 +1745,7 @@
       const basis = BASIS[product.basis] || BASIS_FALLBACK;
       const entry = DB.entries[product.id] || {};
       const messages = [];
+      const beforeStorage = inferStorageMethod(product.zone);
 
       // 스캔 = "지금 막 개봉/해동/소분했다"는 신호로 보고 기준 시각을 현재로 갱신.
       // 안전보관일은 이 baseDate로부터 자동 계산되는 값이라(computeSafeDate),
@@ -1397,10 +1762,30 @@
         messages.push(`소비기한 ${fmtD(expiry)} 등록`);
       }
 
+      // 스캔으로 발생한 QC 이벤트 종류(해동/개봉/소분)를 서버 QC_LOG + INVENTORY에도 반영한다.
+      // 6단계 위치 전환 액션(LocationTransition)이 추가된 이후에도, 기존 postQC 호출은
+      // 백엔드 handleQC_에서 그대로 라우팅되므로 호환된다.
+      const actionLabelByBasis = { thaw: '해동', open: '개봉', subdiv: '소분' };
+      const statusByBasis = { thaw: '해동중', open: '개봉', subdiv: '개봉' };
+      const afterStorage = product.basis === 'thaw' ? '냉장' : beforeStorage;
+      if (actionLabelByBasis[product.basis]) {
+        entry.status = statusByBasis[product.basis];
+        entry.safeUntil = computeSafeDate(product, entry);
+        SheetSync.postQC({
+          barcode: product.barcode,
+          action: actionLabelByBasis[product.basis],
+          beforeStorage,
+          afterStorage,
+          quantity: entry.qty ?? 1,
+          operator: '관리자'
+        }); // 결과를 기다리지 않고 백그라운드로 전송
+        if (product.basis === 'thaw') product.storageMethod = '냉장';
+      }
+
       if (messages.length) {
         entry.updatedAt = new Date().toISOString();
         DB.entries[product.id] = entry;
-        await persist();
+        await persistEntry(product.id);
         toast(`${product.name} · ${messages.join(' · ')}`);
       } else {
         toast(`${product.name} 인식됨 (관리 기준 없음)`);
@@ -1516,6 +1901,12 @@
               if (baseStr) line1parts.push(`${dateLabelShort}:${baseStr}`);
               if (safeStr) line1parts.push(`안전:${safeStr}`);
               if (line1parts.length) pushLine('  ' + line1parts.join('  '));
+            }
+
+            // 소분 품목은 통 교체 예정일도 함께 표기(식품 소비기한과는 별개 값)
+            if (p.basis === 'subdiv') {
+              const containerDue = computeContainerDue(p, entry);
+              if (containerDue) pushLine(`  통교체:${fmtDTShort(containerDue)}`);
             }
 
             // 2줄 이후 : 재고별 관리 품목은 재고(수량+소비기한)를 한 줄씩,
@@ -1646,7 +2037,48 @@
       DB.entries[productId] = entry;
 
       await persistEntry(productId);
+      // 백엔드 6단계 액션(discard)에도 사유를 함께 남겨 LOG/INVENTORY에 반영
+      LocationTransition.discard({ barcode: product.barcode, reason: reason === 'expiry' ? 'expiry' : (product.basis === 'subdiv' ? 'container' : 'safe'), quantity: entry.qty ?? 1, operator: '관리자' });
       toast(`${product.name} 폐기 처리 완료`);
+    }
+
+    // 사용 완료 처리: 직원이 재고를 다 써서 스캔 후 "사용 완료"를 눌렀을 때.
+    // discardProduct(소비기한/안전보관일 만료로 인한 폐기)와는 별개의 흐름이다.
+    // - lotIdx가 주어지면 해당 로트만 제거(부분 소진), 없으면 해당 품목의 추적 정보를 초기화.
+    // - 서버 QC_LOG에도 action:'사용완료'로 기록하고 재고 수량을 반영한다.
+    async function consumeProduct(productId, lotIdx) {
+      const product = DB.products.find(p => p.id === productId);
+      if (!product) return;
+      const entry = DB.entries[productId] || {};
+      let consumedQty = 1;
+
+      if (product.stockTracking && Array.isArray(entry.lots) && lotIdx != null) {
+        const lot = entry.lots[lotIdx];
+        consumedQty = lot ? (lot.qty ?? 1) : 1;
+        entry.lots.splice(lotIdx, 1);
+        if (entry.lots.length === 0) entry.status = '소진';
+      } else {
+        consumedQty = entry.qty ?? 1;
+        entry.baseDate = null;
+        entry.expiry = null;
+        entry.expiryCleared = true;
+        entry.qty = 0;
+        entry.status = '소진';
+      }
+      entry.updatedAt = new Date().toISOString();
+      DB.entries[productId] = entry;
+      await persistEntry(productId);
+
+      SheetSync.postQC({
+        barcode: product.barcode,
+        action: '사용완료',
+        beforeStorage: inferStorageMethod(product.zone),
+        afterStorage: null,
+        quantity: consumedQty,
+        operator: '관리자'
+      }); // 백그라운드 전송 — 결과를 기다리지 않음
+
+      toast(`${product.name} 사용 완료 처리됨`);
     }
 
     function todayDiscardList() {
@@ -1811,16 +2243,19 @@
           const entry = DB.entries[p.id] || {};
           const basis = BASIS[p.basis] || BASIS_FALLBACK;
           const safe = computeSafeDate(p, entry);
-          const status = safe ? safeStatus(safe) : 'none';
-          const pillClass = status === 'danger' ? 'danger' : status === 'warn' ? 'warn' : status === 'ok' ? 'ok' : '';
+          const status = safe ? safeStatus(safe, p.zone) : 'none';
+          const pillClass = pillClassFor(status);
 
           const doneToday = basis.track && isToday(entry.baseDate);
           const dateLabelShort = basis.dateLabel ? basis.dateLabel.replace('일', '') : '';
           const noProduct = basis.track && !!entry.noProduct;
+          const productType = getProductType(p);
+          // 소분(subdiv) 품목은 통 교체(7일 고정)와 식품 자체 소비기한을 독립적으로 표시
+          const isDualRuleSubdiv = p.basis === 'subdiv' && !p.stockTracking;
 
           html += `<div class="product-row" data-pid="${p.id}">
         <div class="pname">
-          <span>${p.name} <span class="tag">${cat}</span></span>
+          <span>${p.name} <span class="tag">${cat} · ${productType}</span></span>
           ${p.stockTracking
               ? (() => {
                 const lots = entry.lots || [];
@@ -1830,8 +2265,10 @@
                   ? `<span class="safe-pill ${expiryStatus(nearest.expiry)}">소비기한 ${fmtD(nearest.expiry)}</span>`
                   : `<span class="safe-pill">소비기한 미입력</span>`;
               })()
-              : (noProduct ? `<span class="safe-pill warn">${dateLabelShort} 제품 없음</span>`
-                : (safe ? `<span class="safe-pill ${pillClass}">안전 ${fmtDT(safe)}</span>` : (basis.calc ? `<span class="safe-pill">미입력</span>` : '')))}
+              : (isDualRuleSubdiv
+                ? renderDualRuleBadges(p, entry)
+                : (noProduct ? `<span class="safe-pill warn">${dateLabelShort} 제품 없음</span>`
+                  : (safe ? `<span class="safe-pill ${pillClass}">안전 ${fmtDT(safe)}</span>` : (basis.calc ? `<span class="safe-pill">미입력</span>` : ''))))}
         </div>
         ${basis.track ? `
           <label class="no-product-row" style="display:flex; align-items:center; gap:6px; margin:8px 0 6px; font-size:0.8rem; color:var(--muted); cursor:pointer;">
@@ -1849,6 +2286,7 @@
             </details>
           </div>
         ` : ''}
+        ${!p.stockTracking ? `<div class="action-row" style="display:flex; gap:6px; flex-wrap:wrap; margin:6px 0;">${renderActionButtons(productType)}</div>` : ''}
         ${p.stockTracking ? `
           <div class="lot-list" data-pid="${p.id}">
             ${(entry.lots || []).length === 0
@@ -1864,6 +2302,7 @@
                   <input type="date" class="lot-expiry" value="${lot.expiry || ''}">
                 </div>
                 <button type="button" class="small ${lot.opened ? 'primary' : 'ghost'} lot-open-toggle" style="flex:0 0 auto;">${lot.opened ? '✅ 개봉중' : '개봉'}</button>
+                <button type="button" class="small lot-consume" style="flex:0 0 auto;">✅ 사용완료</button>
                 <button type="button" class="small danger lot-del" style="flex:0 0 auto;">삭제</button>
               </div>
             `).join('')}
@@ -1951,6 +2390,47 @@
             renderProductList(zoneKey, document.getElementById('searchInput').value.trim());
           });
         });
+        row.querySelectorAll('.act-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const action = btn.dataset.action;
+            const product = DB.products.find(pp => pp.id === pid);
+            const entry = DB.entries[pid] || {};
+            if (action === 'consume') {
+              if (!confirm('사용 완료(소진) 처리할까요?')) return;
+              await consumeProduct(pid);
+            } else if (action === 'thawStart') {
+              entry.baseDate = nowLocalInputValue();
+              entry.status = '해동중';
+              entry.expiryCleared = false;
+              entry.updatedAt = new Date().toISOString();
+              entry.safeUntil = computeSafeDate(product, entry);
+              DB.entries[pid] = entry;
+              await persistEntry(pid);
+              SheetSync.postQC({ barcode: product.barcode, action: '해동', beforeStorage: '냉동', afterStorage: '냉장', quantity: entry.qty ?? 1, operator: '관리자' });
+              toast(`${product.name} 냉장 해동 시작`);
+            } else if (action === 'openStart') {
+              entry.baseDate = nowLocalInputValue();
+              entry.status = '개봉';
+              entry.expiryCleared = false;
+              entry.updatedAt = new Date().toISOString();
+              entry.safeUntil = computeSafeDate(product, entry);
+              DB.entries[pid] = entry;
+              await persistEntry(pid);
+              SheetSync.postQC({ barcode: product.barcode, action: '개봉', beforeStorage: inferStorageMethod(product.zone), afterStorage: inferStorageMethod(product.zone), quantity: entry.qty ?? 1, operator: '관리자' });
+              toast(`${product.name} 개봉일 기록 · 안전보관일 시작`);
+            }
+            renderProductList(zoneKey, document.getElementById('searchInput').value.trim());
+          });
+        });
+        row.querySelectorAll('.lot-consume').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const lotRow = btn.closest('.lot-row');
+            const idx = Number(lotRow.dataset.lotIdx);
+            if (!confirm('이 재고를 사용 완료 처리할까요?')) return;
+            await consumeProduct(pid, idx);
+            renderProductList(zoneKey, document.getElementById('searchInput').value.trim());
+          });
+        });
         row.querySelectorAll('.lot-del').forEach(btn => {
           btn.addEventListener('click', async () => {
             const lotRow = btn.closest('.lot-row');
@@ -2005,11 +2485,10 @@
       <span class="drag-handle">⠿</span>
       <div class="info">
         <div class="n">${p.name}</div>
-        <div class="m">${p.category || '기타'} · ${p.storageMethod || inferStorageMethod(p.zone)} · ${(BASIS[p.basis] || BASIS_FALLBACK).label}${(BASIS[p.basis] || BASIS_FALLBACK).calc ? ` · ${p.durationValue}${p.durationUnit === 'day' ? '일' : '시간'}` : ''}</div>
+        <div class="m">${p.category || '기타'} · ${p.storageMethod || inferStorageMethod(p.zone)} · ${(BASIS[p.basis] || BASIS_FALLBACK).label}${(BASIS[p.basis] || BASIS_FALLBACK).calc ? ` · ${p.durationValue}${p.durationUnit === 'day' ? '일' : '시간'}` : ''}${p.basis === 'subdiv' ? ` · 통교체 ${p.containerCycleDays || DEFAULT_CONTAINER_CYCLE_DAYS}일` : ''}</div>
         ${p.barcode ? `<svg class="barcode-svg" data-code="${p.barcode}"></svg>` : ''}
       </div>
       <div class="acts">
-        ${p.barcode ? `<button class="small label-btn">🏷 라벨</button>` : ''}
         <button class="small edit-btn">수정</button>
         <button class="small danger del-btn">삭제</button>
       </div>
@@ -2037,13 +2516,6 @@
           await persist();
         });
         row.querySelector('.edit-btn').addEventListener('click', () => openProductForm(zoneKey, row.dataset.pid));
-        const labelBtn = row.querySelector('.label-btn');
-        if (labelBtn) {
-          labelBtn.addEventListener('click', () => {
-            const p = DB.products.find(p => p.id === row.dataset.pid);
-            if (p) printLabel(p);
-          });
-        }
         row.querySelector('.del-btn').addEventListener('click', async () => {
           if (!confirm('이 품목을 삭제할까요?')) return;
           DB.products = DB.products.filter(p => p.id !== row.dataset.pid);
@@ -2094,6 +2566,11 @@
         </div>
       </div>
 
+      <div id="f-container-cycle-wrap" style="${existing?.basis === 'subdiv' ? '' : 'display:none;'}">
+        <label>소분통 교체 주기(일) <span style="font-weight:400; color:var(--muted);">— 식품 소비기한과 별개로 관리됩니다</span></label>
+        <input id="f-container-cycle" type="number" min="1" value="${existing?.containerCycleDays || DEFAULT_CONTAINER_CYCLE_DAYS}" placeholder="예: 7">
+      </div>
+
       <label>기본 소비기한(선택) <span id="f-expiry-hint" style="font-weight:400; color:var(--muted);"></span></label>
       <input id="f-expiry" type="date" value="${existing?.defaultExpiry || ''}">
       <div style="font-size:0.72rem; color:var(--muted); margin-top:4px;">비워두면 보관방법 기준으로 자동 추천됩니다 (냉장 2주 / 냉동 6개월).</div>
@@ -2120,9 +2597,11 @@
 
       const basisSel = overlay.querySelector('#f-basis');
       const durWrap = overlay.querySelector('#f-duration-wrap');
+      const cycleWrap = overlay.querySelector('#f-container-cycle-wrap');
       function toggleDur() {
         const b = BASIS[basisSel.value];
         durWrap.style.display = b.calc ? 'flex' : 'none';
+        cycleWrap.style.display = basisSel.value === 'subdiv' ? 'block' : 'none';
       }
       basisSel.addEventListener('change', toggleDur);
       toggleDur();
@@ -2194,6 +2673,7 @@
         const basis = overlay.querySelector('#f-basis').value;
         const durationValue = Number(overlay.querySelector('#f-duration-value').value) || 0;
         const durationUnit = overlay.querySelector('#f-duration-unit').value;
+        const containerCycleDays = basis === 'subdiv' ? (Number(overlay.querySelector('#f-container-cycle').value) || DEFAULT_CONTAINER_CYCLE_DAYS) : undefined;
         const defaultExpiry = overlay.querySelector('#f-expiry').value || null;
         const stockTracking = overlay.querySelector('#f-stock-tracking').checked;
         const barcode = overlay.querySelector('#f-barcode').value.trim() || generateBarcode();
@@ -2207,15 +2687,92 @@
         }
 
         if (existing) {
-          Object.assign(existing, { zone, storageMethod, category, name, basis, durationValue, durationUnit, defaultExpiry, stockTracking, barcode });
+          Object.assign(existing, { zone, storageMethod, category, name, basis, durationValue, durationUnit, containerCycleDays, defaultExpiry, stockTracking, barcode });
         } else {
           const order = DB.products.filter(p => p.zone === zone).length;
-          DB.products.push({ id: uid(), zone, storageMethod, category, name, basis, durationValue, durationUnit, defaultExpiry, stockTracking, barcode, order });
+          DB.products.push({ id: uid(), zone, storageMethod, category, name, basis, durationValue, durationUnit, containerCycleDays, defaultExpiry, stockTracking, barcode, order });
         }
         await persist();
         overlay.remove();
         if (location.hash.startsWith('#/manage')) renderManage(zone);
         toast('저장됨');
+      });
+    }
+
+    /* ---------- 빠른 입고 모달 ---------- */
+    // 입고모드에서 스캔하면 즉시 이 모달을 띄워 [소비기한 / 수량]만 입력받는다.
+    // 확인 시: 같은 소비기한의 로트가 이미 있으면 수량만 합산, 없으면 새 로트 추가.
+    // 서버(INVENTORY)에도 saveInventory로 반영한다. FRZ_BIG_TOP(대형냉동-상)처럼
+    // receivePriority가 걸린 구역은 모달 제목에 우선순위 표시를 덧붙인다.
+    function addMonths(date, n) { const d = new Date(date); d.setMonth(d.getMonth() + n); return d; }
+    function openQuickReceiveModal(product) {
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay';
+      const todayStr = todayDateOnly();
+      const isPriority = !!(LOCATION_ALERT_RULES[locationCodeForZone(product.zone)] || {}).receivePriority;
+      overlay.innerHTML = `
+    <div class="sheet">
+      <h3>${isPriority ? '⭐ ' : ''}📥 빠른 입고 — ${product.name}${isPriority ? ' <span style="font-size:0.7rem; color:var(--orange);">(입고 우선구역)</span>' : ''}</h3>
+      <label>소비기한</label>
+      <input type="date" id="qr-expiry" value="${todayStr}">
+      <div class="actions" style="margin:8px 0;">
+        <button type="button" class="small ghost" id="qr-plus1w">+1주</button>
+        <button type="button" class="small ghost" id="qr-plus1m">+1달</button>
+        <button type="button" class="small ghost" id="qr-nextyear">내년</button>
+      </div>
+      <label>수량</label>
+      <input type="number" id="qr-qty" min="1" value="1">
+      <div class="actions" style="margin-top:16px;">
+        <button class="ghost" id="qr-cancel">취소</button>
+        <button class="primary" id="qr-confirm">확인</button>
+      </div>
+    </div>
+  `;
+      document.body.appendChild(overlay);
+      const expiryEl = overlay.querySelector('#qr-expiry');
+      const qtyEl = overlay.querySelector('#qr-qty');
+      overlay.querySelector('#qr-plus1w').addEventListener('click', () => {
+        const d = new Date(expiryEl.value || todayStr); d.setDate(d.getDate() + 7);
+        expiryEl.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      });
+      overlay.querySelector('#qr-plus1m').addEventListener('click', () => {
+        const d = addMonths(expiryEl.value || todayStr, 1);
+        expiryEl.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      });
+      overlay.querySelector('#qr-nextyear').addEventListener('click', () => {
+        const d = new Date(expiryEl.value || todayStr); d.setFullYear(d.getFullYear() + 1);
+        expiryEl.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      });
+      overlay.querySelector('#qr-cancel').addEventListener('click', () => overlay.remove());
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+      overlay.querySelector('#qr-confirm').addEventListener('click', async () => {
+        const expiry = expiryEl.value || null;
+        const qty = Number(qtyEl.value) || 1;
+        const entry = DB.entries[product.id] || {};
+        entry.lots = entry.lots || [];
+        const existing = entry.lots.find(l => l.expiry === expiry);
+        if (existing) {
+          existing.qty = (existing.qty || 0) + qty;
+        } else {
+          entry.lots.push({ qty, expiry, opened: false, baseDate: nowLocalInputValue() });
+        }
+        entry.status = entry.status || '정상';
+        entry.updatedAt = new Date().toISOString();
+        DB.entries[product.id] = entry;
+        await persistEntry(product.id); // INVENTORY 시트에도 합계 수량으로 반영됨
+
+        // 6단계 위치 전환 액션(receive)으로도 서버에 반영 — LOG에 입고 기록이 남고,
+        // receivePriority 구역이면 res.receivePriority === true로 응답된다.
+        LocationTransition.receive({
+          barcode: product.barcode, productName: product.name, category: product.category,
+          zoneKey: product.zone, quantity: qty, expiryDate: expiry, operator: '관리자'
+        });
+
+        overlay.remove();
+        toast(`${product.name} ${qty}개 입고 완료!`);
+        if (location.hash.startsWith('#/zone/' + product.zone)) {
+          renderProductList(product.zone, '');
+        }
       });
     }
 
@@ -2244,8 +2801,8 @@
           const reason = isDiscard ? item.reason : 'safe';
           const pillHtml = (() => {
             if (reason === 'safe') {
-              const status = safeStatus(item.safe);
-              const pillClass = status === 'danger' ? 'danger' : status === 'warn' ? 'warn' : 'ok';
+              const status = safeStatus(item.safe, product.zone);
+              const pillClass = pillClassFor(status) || 'ok';
               return `<span class="safe-pill ${pillClass}">안전 ${fmtDT(item.safe)}</span>`;
             }
             const status = expiryStatus(item.expiry);
@@ -2343,14 +2900,70 @@
 
     document.getElementById('connBtn').addEventListener('click', connectPrinter);
 
+    // 입고모드에서의 스캔: handleScan(사용/해동/개봉 시작 신호)과는 별개로,
+    // 제품을 찾아 바로 [소비기한/수량] 입력 모달을 띄운다.
+    // FRZ_BIG_TOP(대형냉동-상)처럼 receivePriority가 걸린 구역 품목은
+    // receiveQueue에서 항상 먼저 처리되도록 큐를 거쳐 모달을 연다.
+    async function handleReceiveScan(raw) {
+      const value = String(raw || '').trim();
+      if (!value) return;
+      const parsed = parseGS1Barcode(value);
+      let gtin = parsed.gtin;
+      if (!gtin && /^\d{8,14}$/.test(value)) gtin = value;
+      if (!gtin) { toast('인식할 수 없는 바코드입니다'); return; }
+
+      let product = DB.products.find(p => p.barcode && normalizeGtin(p.barcode) === normalizeGtin(gtin));
+      if (!product) {
+        const scanResult = await SheetSync.scanBarcode(gtin);
+        if (scanResult && scanResult.success && scanResult.product) {
+          const sp = scanResult.product; // MASTER_PRODUCTS 행: barcode/productName/category/storage/ruleType/days
+          const currentZone = (ZONES.find(z => location.hash.includes('zone/' + z.key)) || ZONES[0]).key;
+          product = {
+            id: uid(), zone: currentZone, category: sp.category || '기타', name: sp.productName || gtin,
+            basis: ruleTypeToBasis(sp.ruleType), durationValue: Number(sp.days) || 0,
+            durationUnit: 'day', storageMethod: sp.storage || null, barcode: gtin, stockTracking: true, order: DB.products.length,
+            containerCycleDays: Number(sp.containerCycleDays) || DEFAULT_CONTAINER_CYCLE_DAYS
+          };
+          DB.products.push(product);
+          await persist();
+        }
+      }
+      if (!product) {
+        if (confirm(`등록되지 않은 바코드입니다.\n(${gtin})\n\n새 품목으로 등록하시겠습니까?`)) {
+          const currentZone = (ZONES.find(z => location.hash.includes('zone/' + z.key)) || ZONES[0]).key;
+          openProductForm(currentZone, null, gtin);
+        }
+        return;
+      }
+      enqueueReceive(product);
+      const next = nextReceiveFromQueue();
+      if (next) openQuickReceiveModal(next);
+    }
+
     /* ---------- 전역 바코드 스캔 입력창 ---------- */
+    let receiveMode = false;
+    const receiveModeBtn = document.getElementById('receiveModeBtn');
+    function updateReceiveModeUI() {
+      receiveModeBtn.classList.toggle('primary', receiveMode);
+      receiveModeBtn.textContent = receiveMode ? '📥 입고모드 ON (스캔하세요)' : '📥 빠른입고';
+    }
+    receiveModeBtn.addEventListener('click', () => {
+      receiveMode = !receiveMode;
+      updateReceiveModeUI();
+      if (receiveMode) globalScanInput.focus();
+    });
+
     const globalScanInput = document.getElementById('globalScanInput');
     globalScanInput.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
       e.preventDefault();
       const val = globalScanInput.value;
       globalScanInput.value = '';
-      handleScan(val);
+      if (receiveMode) {
+        handleReceiveScan(val);
+      } else {
+        handleScan(val);
+      }
     });
     // 화면 어디를 클릭하든(입력 필드 제외) 스캐너 입력이 항상 이 칸으로 들어오도록 포커스 유지
     document.addEventListener('click', (e) => {
