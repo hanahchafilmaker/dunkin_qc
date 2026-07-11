@@ -1627,6 +1627,76 @@
       }
     }
 
+    /* =========================================================
+       4-1. 진단용 테스트 출력 (한글 깨짐 / 커팅 안됨 원인 확인)
+       ---------------------------------------------------------
+       모드 A: 기존 방식 그대로 (FS & 한글모드 + 5줄 feed + GS V 0)
+       모드 B: FS & 한글모드 없이 CP949 바이트만 전송 (+ 기존 feed/cut)
+       모드 C: 기존 한글모드 + feed를 늘리고 GS V 66(feed-and-cut) 사용
+       모드 D: 한글모드 없이 + feed를 늘리고 GS V 66(feed-and-cut) 사용
+       각 모드로 출력해보고 어느 조합이 정상 출력되는지 확인한 뒤,
+       그 결과에 맞춰 기본 출력 함수(printText/printSegments)를
+       확정하면 됩니다.
+       ========================================================= */
+    async function printTestVariant(mode) {
+      let localPort = null;
+      try {
+        if (savedPort) {
+          localPort = savedPort;
+        } else {
+          localPort = await navigator.serial.requestPort();
+          savedPort = localPort;
+        }
+
+        await localPort.open({ baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', flowControl: 'none' });
+        setConnected(true);
+
+        const useHangulMode = (mode === 'A' || mode === 'C');
+        const useFeedAndCut = (mode === 'C' || mode === 'D');
+
+        const label = { A: '모드 A (기존)', B: '모드 B (한글모드 제거)', C: '모드 C (컷 여유 확대)', D: '모드 D (한글모드 제거 + 컷 여유 확대)' }[mode];
+        const text = DIV32 + '\n' + center('테스트 출력 - ' + label) + '\n' + DIV32 + '\n출력시간 : ' + fmtNow() + '\n한글/영문 출력 확인용입니다.\n\n\n';
+
+        const writer = localPort.writable.getWriter();
+        await writer.write(Uint8Array.from([0x1B, 0x40]));      // ESC @ : 초기화
+        await writer.write(Uint8Array.from([0x1B, 0x33, 20]));  // ESC 3 n : 줄간격 압축
+
+        if (useHangulMode) {
+          await writer.write(Uint8Array.from([0x1C, 0x26]));    // FS & : 한글 모드 켜기
+          await writer.write(encodeKorean(text));
+          await writer.write(Uint8Array.from([0x1C, 0x2E]));    // FS . : 한글 모드 끄기
+        } else {
+          await writer.write(encodeKorean(text));                // 한글 모드 전환 없이 CP949 바이트만 전송
+        }
+
+        if (useFeedAndCut) {
+          await writer.write(Uint8Array.from([0x1B, 0x64, 0x08])); // 8줄 feed (여유 확대)
+          await writer.write(Uint8Array.from([0x1D, 0x56, 0x42, 0x00])); // GS V 66 0 : feed-and-cut
+        } else {
+          await writer.write(Uint8Array.from([0x1B, 0x64, 0x05])); // 5줄 feed (기존)
+          await writer.write(Uint8Array.from([0x1D, 0x56, 0x00])); // GS V 0 : 즉시 컷 (기존)
+        }
+        writer.releaseLock();
+
+        log(`[${mode}] 출력 완료`);
+        toast(`${label} 출력 완료`);
+      } catch (e) {
+        console.error(e);
+        log(e);
+        alert('출력 오류: ' + (e.message || e));
+      } finally {
+        if (localPort) {
+          try {
+            await localPort.close();
+          } catch (closeErr) {
+            console.error('포트 닫기 실패:', closeErr);
+            log(closeErr);
+          }
+        }
+        setConnected(false);
+      }
+    }
+
     // 품목 라벨 출력: 품명 + 실물 스캔 가능한 CODE128 바코드(GS k)
     // (라벨 출력 기능은 사용하지 않기로 하여 제거됨 — 필요해지면 printSegments/buildBarcodeBytes로 재구현)
 
@@ -2863,8 +2933,15 @@
     </div>
     <div class="panel">
       <h3>프린터 테스트</h3>
+      <p style="font-size:0.82rem; color:var(--muted);">기본 테스트 출력이 한글이 깨지거나 커팅이 안 될 경우, 아래 4가지 모드를 하나씩 눌러 어느 조합이 정상 출력되는지 확인해 주세요.</p>
       <div class="actions">
-        <button id="testPrintBtn">🖨️ 테스트 출력</button>
+        <button id="testPrintBtn">🖨️ 테스트 출력 (기본)</button>
+      </div>
+      <div class="actions" style="margin-top:8px; flex-wrap:wrap; gap:6px;">
+        <button id="testPrintA">A: 기존 방식</button>
+        <button id="testPrintB">B: 한글모드 제거</button>
+        <button id="testPrintC">C: 컷 여유 확대</button>
+        <button id="testPrintD">D: 한글모드 제거 + 컷 여유 확대</button>
       </div>
     </div>
   `;
@@ -2897,6 +2974,10 @@
       document.getElementById('testPrintBtn').addEventListener('click', () => {
         printText(DIV32 + '\n' + center('테스트 출력') + '\n' + DIV32 + '\n출력시간 : ' + fmtNow() + '\n한글/영문 출력 확인용입니다.\n\n\n');
       });
+      document.getElementById('testPrintA').addEventListener('click', () => printTestVariant('A'));
+      document.getElementById('testPrintB').addEventListener('click', () => printTestVariant('B'));
+      document.getElementById('testPrintC').addEventListener('click', () => printTestVariant('C'));
+      document.getElementById('testPrintD').addEventListener('click', () => printTestVariant('D'));
     }
 
     document.getElementById('connBtn').addEventListener('click', connectPrinter);
