@@ -1102,7 +1102,7 @@
           durationValue: Number(row.days) || 0,
           durationUnit: 'day',
           containerCycleDays: row.containerCycleDays || prev?.containerCycleDays || DEFAULT_CONTAINER_CYCLE_DAYS,
-          zone: prev?.zone || defaultZoneForStorage(row.storage),
+          zone: prev?.zone || LOCATION_CODE_REVERSE[row.defaultLocation] || defaultZoneForStorage(row.storage),
           order: prev?.order ?? idx,
           stockTracking: prev?.stockTracking || false,
           defaultExpiry: prev?.defaultExpiry || null
@@ -1216,6 +1216,7 @@
           productName: product.name,
           category: product.category,
           storage: product.storageMethod,
+          defaultLocation: locationCodeForZone(product.zone),
           ruleType: basisToRuleType(product.basis),
           days: product.durationValue,
           containerCycleDays: product.containerCycleDays
