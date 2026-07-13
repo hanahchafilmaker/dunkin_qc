@@ -2407,11 +2407,11 @@
           }
           if (expiryInput) {
             entry.expiry = expiryInput.value || null;
-            if (entry.expiry) entry.expiryCleared = false; // 직접 입력했으니 폐기 표시 해제
+            if (entry.expiry) entry.expiryCleared = false;
           }
           entry.updatedAt = new Date().toISOString();
           DB.entries[pid] = entry;
-          await persist();
+          await persistEntry(pid); // ← persist() → persistEntry(pid)
           toast('저장됨');
           renderProductList(zoneKey, document.getElementById('searchInput').value.trim());
         }
@@ -2441,7 +2441,7 @@
             entry.lots[idx].expiry = lotRow.querySelector('.lot-expiry').value || null;
             entry.updatedAt = new Date().toISOString();
             DB.entries[pid] = entry;
-            await persist();
+            await persistEntry(pid); // ← persist() → persistEntry(pid)
             toast('저장됨');
           });
         });
@@ -2507,7 +2507,7 @@
             const entry = DB.entries[pid] || {};
             if (entry.lots) entry.lots.splice(idx, 1);
             DB.entries[pid] = entry;
-            await persist();
+            await persistEntry(pid); // ← persist() → persistEntry(pid)
             renderProductList(zoneKey, document.getElementById('searchInput').value.trim());
           });
         });
