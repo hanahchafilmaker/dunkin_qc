@@ -35,20 +35,31 @@
    ⑥ 60초마다 홈 화면 자동 새로고침
 
    ---------------------------------------------------------
-   [수정 내역] 입고(receive) 액션 버그 수정
+   [수정 내역 v2] 이중 쓰기(double write) 버그 수정
    ---------------------------------------------------------
-   - 기존에는 입고 모달에 소비기한 입력 필드가 없었고, 확인을 눌러도
-     entry.lots에 실제로 반영되지 않아 화면/시트 수량이 갱신되지 않는
-     문제가 있었습니다.
+   - 기존에는 receive/thaw/subdivide 액션에서 persistEntry()(서버에도
+     쓰는 함수)와 LocationTransition.*(서버에 쓰는 함수)를 같은 액션
+     안에서 둘 다 호출하고 있었습니다.
+   - 이 두 경로는 서로 다른 저장 방식(persistEntry = 바코드당 1행을
+     patch하려는 v1식 경로, LocationTransition = 로트 단위로 새/기존
+     행을 다루는 v2 경로)을 쓰기 때문에, 같은 이벤트 하나에 대해
+     서버(INVENTORY 시트)에 행이 중복 생성되거나 location/opened 값이
+     빈 채로 저장되는 문제가 실제로 발생했습니다.
    - 이번 수정에서:
-     1) 입고(receive) 액션에도 소비기한 입력 필드를 노출합니다.
-     2) 재고관리(stockTracking) 품목은 원본 openQuickReceiveModal과
-        동일하게 entry.lots에 로트를 합산/추가합니다.
-     3) 재고관리 대상이 아닌 일반 품목은 entry.qty를 누적하고
-        entry.expiry를 갱신해 화면(재고 목록)에도 즉시 반영되도록
-        분기 처리했습니다.
-     4) LocationTransition.receive 호출 시 expiryDate를 함께 전달해
-        서버(INVENTORY) 쪽에도 소비기한이 정확히 반영되도록 했습니다.
+     1) receive/thaw/subdivide 세 액션 모두 서버 쓰기는
+        LocationTransition.* 호출 "한 번"으로 통일했습니다.
+     2) 로컬 상태(DB.entries) 갱신은 persistEntry() 대신 persist()
+        (로컬 저장만, 서버에 안 씀)로 바꿨습니다.
+     3) LocationTransition.receive/subdivide가 반환하는 lotId /
+        newLotId를 entry.lotId에 저장해, 이후 같은 로트를 다시 다룰
+        때(예: 소비기한 직접 수정) 서버가 새 로트를 또 만들지 않고
+        기존 로트를 patch하도록 했습니다.
+     4) thaw/subdivide 호출 시에도 entry.lotId가 있으면 함께 넘겨서
+        어떤 로트를 대상으로 하는지 명확히 지정하도록 했습니다.
+        (이 lotId 파라미터를 받으려면 원본 dunkin_qc.html의
+        LocationTransition.thaw / LocationTransition.subdivide 함수에도
+        lotId를 body에 실어 보내도록 별도 수정이 필요합니다 — 백엔드
+        actionThaw_/actionSubdivide_는 이미 body.lotId를 지원합니다.)
    ========================================================= */
 (function () {
   'use strict';
@@ -160,7 +171,6 @@
 
   /* ---------------------------------------------------------
      4. STEP 5 — prompt() 없는 전용 입력 모달 (수량/위치/날짜/사유)
-        [수정] 소비기한 입력 필드를 'receive'(입고) 액션에도 노출.
         - subdivide: 식품 소비기한(통 교체일과는 별개) 라벨 사용
         - receive : 일반적인 "소비기한" 라벨 사용
      --------------------------------------------------------- */
@@ -217,19 +227,15 @@
   }
 
   /* ---------------------------------------------------------
-     5. STEP 5-7 — 저장: 기존 LocationTransition(서버 반영)과
-        기존 로컬 저장 흐름(persist/persistEntry/consumeProduct/
-        discardProduct)을 그대로 사용해, 화면이 즉시 갱신되도록 처리.
+     5. STEP 5-7 — 저장
 
-        [수정] receive 케이스:
-        - 재고관리(stockTracking) 품목: 원본 openQuickReceiveModal과
-          동일하게 같은 소비기한의 로트가 있으면 수량만 합산, 없으면
-          새 로트를 push.
-        - 일반 품목(stockTracking:false): entry.qty를 누적하고
-          entry.expiry를 갱신 → 구역 화면의 소비기한 입력창에도
-          즉시 반영됨.
-        - 두 경우 모두 LocationTransition.receive에 expiryDate를
-          함께 전달해 서버(INVENTORY) 값도 정확히 반영.
+        ⚠️ 서버 쓰기는 반드시 LocationTransition.* 한 곳에서만 한다.
+        (receive/thaw/subdivide) persistEntry()는 서버(saveInventory_)
+        에도 쓰는 함수라서, LocationTransition.*와 같이 부르면 같은
+        이벤트 하나에 대해 서버 행이 중복 생성되거나 location/opened
+        값이 빈 채로 저장되는 문제가 있었다. 로컬 상태 갱신은
+        persist()(로컬 저장만)로 하고, 서버가 돌려주는 lotId를
+        entry.lotId에 저장해 이후에도 같은 로트를 계속 추적한다.
      --------------------------------------------------------- */
   async function submitInventoryAction(overlay) {
     const product = currentInventoryProduct;
@@ -264,11 +270,19 @@
           entry.status = entry.status || '정상';
           entry.updatedAt = new Date().toISOString();
           DB.entries[product.id] = entry;
-          await persistEntry(product.id);
-          await LocationTransition.receive({
+          await persist(); // 로컬 저장만 (서버 쓰기는 아래 LocationTransition.receive 한 번뿐)
+
+          const res = await LocationTransition.receive({
             barcode: product.barcode, productName: product.name, category: product.category,
             zoneKey: product.zone, quantity: qty, expiryDate: expiry, operator: '관리자'
           });
+          if (res && res.success && res.lotId) {
+            // 서버가 발급한 lotId를 기억해둬야, 이후 이 로트를 다시 patch할 때
+            // (예: 구역 화면에서 소비기한을 직접 수정) 새 로트가 또 생기지 않는다.
+            entry.lotId = res.lotId;
+            DB.entries[product.id] = entry;
+            await persist();
+          }
           toast(`${product.name} ${qty}개 입고 처리`);
           break;
         }
@@ -284,26 +298,46 @@
           break;
         }
         case 'thaw': {
+          // ⚠️ 서버 쓰기는 LocationTransition.thaw() 한 곳만. actionThaw_()는
+          // entry.lotId(있으면) 또는 FIFO로 기존 로트를 찾아 patch하므로,
+          // persistEntry()를 같이 부르면 같은 로트에 대해 이중 쓰기가 발생한다.
           entry.baseDate = nowLocalInputValue();
           entry.status = '해동중';
           entry.expiryCleared = false;
           entry.updatedAt = new Date().toISOString();
           entry.safeUntil = computeSafeDate(product, entry);
           DB.entries[product.id] = entry;
-          await persistEntry(product.id);
-          await LocationTransition.thaw({ barcode: product.barcode, fromZoneKey: product.zone, quantity: qty, operator: '관리자' });
+          await persist(); // 로컬 저장만
+
+          await LocationTransition.thaw({
+            barcode: product.barcode, fromZoneKey: product.zone, quantity: qty, operator: '관리자',
+            lotId: entry.lotId || undefined // 알고 있는 lotId가 있으면 정확히 그 로트를 지정
+          });
           toast(`${product.name} 해동 처리`);
           break;
         }
         case 'subdivide': {
+          // ⚠️ 소분도 동일한 이유로 LocationTransition.subdivide() 한 곳만 서버에 쓴다.
+          // actionSubdivide_()는 항상 새 로트(소분통)를 만들어 반환하므로,
+          // 그 newLotId를 로컬에 반영해 이후 계속 같은 소분통 로트를 추적하게 한다.
           const foodExpiry = overlay.querySelector('#inv-expiry').value || null;
           entry.baseDate = nowLocalInputValue(); // 소분통 교체일 계산 기준
           entry.expiry = foodExpiry;             // 식품 자체 소비기한(통교체와 별개, Dual-Rule)
           entry.expiryCleared = false;
           entry.updatedAt = new Date().toISOString();
           DB.entries[product.id] = entry;
-          await persistEntry(product.id);
-          await LocationTransition.subdivide({ barcode: product.barcode, quantity: qty, foodExpiryDate: foodExpiry, operator: '관리자' });
+          await persist(); // 로컬 저장만
+
+          const res = await LocationTransition.subdivide({
+            barcode: product.barcode, quantity: qty, foodExpiryDate: foodExpiry, operator: '관리자',
+            lotId: entry.lotId || undefined // 원본 로트에서 소분해가는 것이라면 지정
+          });
+          if (res && res.success && res.newLotId) {
+            // 새로 만들어진 소분통 로트의 lotId를 기억해둔다.
+            entry.lotId = res.newLotId;
+            DB.entries[product.id] = entry;
+            await persist();
+          }
           toast(`${product.name} 소분 처리`);
           break;
         }
