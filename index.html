@@ -1140,6 +1140,9 @@
         lines.push('상태 : ' + lot.status);
         lines.push('보관장소 : ' + (locOf(lot.location) ? locOf(lot.location).name : lot.location));
         lines.push('소비기한 : ' + (lot.expiry || '-'));
+        if (lot.openDate) {
+          lines.push('개봉일 : ' + lot.openDate);
+        }
         lines.push('안전보관일 : ' + (lot.safeUntil || '-'));
         lines.push(DIV);
         lines.push('');
@@ -1899,7 +1902,26 @@
         // receive view
         var filterInput = document.getElementById('receiveFilterInput');
         if (filterInput) {
-          filterInput.addEventListener('input', function () {
+          var isComposing = false;
+
+          // 한글 조합(자음+모음 결합) 중에는 절대 리렌더링하지 않음.
+          // 리렌더링이 입력창 DOM을 새로 만들면서 조합 중이던 상태가 끊겨
+          // "두바" 대신 "ㄷㅜㅂㅏ"처럼 낱개로 분리되는 문제가 있었음.
+          filterInput.addEventListener('compositionstart', function () {
+            isComposing = true;
+          });
+
+          filterInput.addEventListener('compositionend', function () {
+            isComposing = false;
+            state.receiveFilter = filterInput.value;
+            render();
+            var el = document.getElementById('receiveFilterInput');
+            if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+          });
+
+          filterInput.addEventListener('input', function (e) {
+            // 브라우저가 조합 중임을 알려주는 경우도 이중으로 방어
+            if (isComposing || e.isComposing) return;
             state.receiveFilter = filterInput.value;
             render();
             var el = document.getElementById('receiveFilterInput');
