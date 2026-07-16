@@ -35,22 +35,6 @@
       }
     }
 
-    // 3. 내비게이션 기능 (화면 전환)
-    function initNavigation() {
-      document.querySelectorAll('[data-nav]').forEach(el => {
-        el.addEventListener('click', (e) => {
-          const target = e.target.getAttribute('data-nav');
-          console.log("이동할 화면:", target);
-          // 여기서 실제 화면을 보여주는 로직을 실행 (예: document.getElementById(target).style.display = 'block')
-        });
-      });
-    }
-
-    // 4. 앱 초기화
-    window.addEventListener('load', () => {
-      initNavigation();
-      console.log("내비게이션 연결 완료");
-    });
   </script>
 
   <style>
