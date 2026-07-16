@@ -897,41 +897,62 @@
       };
 
       /* ============ storage helpers ============ */
-      async function loadKey(key, def, shared) {
+
+      async function loadKey(key, def) {
         try {
-          var r = await window.storage.get(key, shared);
-          if (!r || typeof r.value === 'undefined') return def;
-          return JSON.parse(r.value);
-        } catch (e) { return def; }
-      }
-      async function saveKey(key, value, shared) {
-        try {
-          var r = await window.storage.set(key, JSON.stringify(value), shared);
-          if (!r) throw new Error('empty result');
-          return true;
+          const res = await fetch(
+            SCRIPT_URL +
+            "?action=get&key=" +
+            encodeURIComponent(key)
+          );
+
+          const data = await res.json();
+
+          if (
+            !data ||
+            data.value === undefined ||
+            data.value === null ||
+            data.value === ""
+          ) {
+            return def;
+          }
+
+          return JSON.parse(data.value);
+
         } catch (e) {
-          console.error('storage save failed', key, e);
-          showToast('저장에 실패했어요. 네트워크를 확인하고 다시 시도해주세요.');
-          return false;
+          console.error("load failed", key, e);
+          return def;
         }
       }
 
-      async function loadAll() {
-        state.loading = true; render();
-        var results = await Promise.all([
-          loadKey('products', [], true),
-          loadKey('inventory', [], true),
-          loadKey('actionlog', [], true),
-          loadKey('staffName', '', false)
-        ]);
-        state.products = results[0];
-        state.inventory = results[1];
-        state.log = results[2];
-        state.staffName = results[3];
-        state.loading = false;
-        render();
-      }
+      async function saveKey(key, value) {
+        try {
 
+          const res = await fetch(SCRIPT_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "text/plain;charset=utf-8"
+            },
+            body: JSON.stringify({
+              action: "set",
+              key: key,
+              value: JSON.stringify(value)
+            })
+          });
+
+          const data = await res.json();
+
+          if (!data.ok) {
+            throw new Error("save failed");
+          }
+
+          return true;
+
+        } catch (e) {
+          console.error("save failed", key, e);
+          return false;
+        }
+      }
       /* ============ date helpers ============ */
       function pad(n) { return String(n).padStart(2, '0'); }
       function fmtLocal(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
