@@ -187,45 +187,6 @@
       outline-offset: 1px;
     }
 
-    .printer-status {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--card);
-      border: 1.5px solid var(--line);
-      border-radius: 99px;
-      padding: 6px 12px;
-      font-size: 12.5px;
-      color: var(--ink-soft);
-      flex: none;
-    }
-
-    .printer-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: var(--ink-faint);
-      flex: none;
-    }
-
-    .printer-dot.on {
-      background: var(--safe);
-    }
-
-    button.small {
-      border: 1.5px solid var(--line);
-      background: var(--card);
-      color: var(--ink);
-      border-radius: 99px;
-      padding: 4px 10px;
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    button.small:hover {
-      border-color: var(--accent);
-    }
-
     .tabs {
       display: flex;
       gap: 6px;
@@ -866,15 +827,6 @@
     (function () {
       "use strict";
 
-      /* =========================================================
-         Google Apps Script 백엔드 연동 설정
-         ---------------------------------------------------------
-         이 페이지는 window.storage(Claude 아티팩트 전용 API)가 아니라
-         Google Apps Script 웹앱(Google Sheets 백엔드)을 통해 데이터를
-         읽고 씁니다. 아래 URL을 본인의 배포 URL로 바꾸세요.
-         ========================================================= */
-      var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzzrenkdvwa8LqmAC_-M4HpfLLRYaT4DG3XjRedpxfpdauOmnNODasYr8x4YfU0zgQX/exec';
-
       /* ============ constants ============ */
       var LOCATIONS = [
         { code: 'FRG_BEV', name: '냉장(음료)', group: '냉장' },
@@ -914,23 +866,6 @@
       function locOf(code) { for (var i = 0; i < LOCATIONS.length; i++) { if (LOCATIONS[i].code === code) return LOCATIONS[i]; } return null; }
       function storageCatOf(code) { for (var i = 0; i < STORAGE_CATS.length; i++) { if (STORAGE_CATS[i].code === code) return STORAGE_CATS[i]; } return null; }
 
-      // ---------------------------------------------------------------------
-      // 위치별 재고현황 출력(CSV) 기능 전용 위치 코드.
-      // 이 앱의 LOCATIONS(냉장/냉동/상온 제품관리 코드)와는 별개로, 매장 QC
-      // 시스템이 내보내는 재고현황 CSV(예: INVENTORY_*.csv)는 실제 냉장고
-      // 칸별 코드를 쓴다. 두 체계를 억지로 맞추지 않고, 출력 전용으로
-      // 이 표를 따로 둔다.
-      // ---------------------------------------------------------------------
-      var STATUS_LOCATIONS = [
-        { code: 'FRG_L_BEV', name: '냉장(좌)' },
-        { code: 'FRG_R_THAW', name: '냉장(우)' },
-        { code: 'FRZ_SML', name: '냉동고' },
-        { code: 'FRZ_BIG_TOP', name: '대형냉동고(상)' },
-        { code: 'FRZ_BIG_BOT', name: '대형냉동고(하)' },
-        { code: 'ROOM_TEMP', name: '상온' }
-      ];
-      function statusLocOf(code) { for (var i = 0; i < STATUS_LOCATIONS.length; i++) { if (STATUS_LOCATIONS[i].code === code) return STATUS_LOCATIONS[i]; } return null; }
-
       // 제품 정의로부터 로트의 상태 흐름(steps)을 계산.
       // 항상 [보관] -> (전환 액션, toAction!==EXPIRY일 때만) -> [소진] 순서.
       function stepsFor(product) {
@@ -958,63 +893,21 @@
         receiveSelected: null,
         receiveFilter: '',
         editingProduct: null,
-        modal: null, // {type:'discard', lot} | {type:'import'} | {type:'printStatus'}
-        printerConnected: false,
-        // 위치별 재고현황 출력 기능 전용 임시 상태 (저장소에 영속화하지 않음 - 매번 새로 붙여넣거나 파일을 올려서 씀)
-        statusCsvLots: [],       // parseLocationStatusCsv() 결과
-        statusCsvErrors: [],
-        statusSelectedLoc: 'ALL' // 'ALL' 또는 STATUS_LOCATIONS의 code
+        modal: null // {type:'discard', lot} 
       };
 
-      /* ============ storage helpers ============
-         Google Apps Script 웹앱(Google Sheets 백엔드)을 key-value 저장소로 사용.
-         - 조회(get)는 GET 요청 (프리플라이트 없음)
-         - 저장(set)은 POST 요청이지만 Content-Type을 text/plain으로 보내
-           브라우저가 CORS 프리플라이트(OPTIONS)를 띄우지 않게 함.
-           Apps Script는 OPTIONS 요청에 응답하지 않아 프리플라이트가 걸리면
-           그대로 실패하므로 이 부분이 중요함.
-         - staffName(담당자 이름)은 기기별 개인 설정이라 시트에 넣지 않고
-           그냥 이 브라우저의 localStorage에 저장 (shared:false 대응).
-      ============ */
+      /* ============ storage helpers ============ */
       async function loadKey(key, def, shared) {
-        if (shared === false) {
-          try {
-            var raw = localStorage.getItem('stampboard:' + key);
-            return raw === null ? def : JSON.parse(raw);
-          } catch (e) { return def; }
-        }
         try {
-          var url = APPS_SCRIPT_URL + '?action=get&key=' + encodeURIComponent(key);
-          var res = await fetch(url, { method: 'GET' });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          var data = await res.json();
-          if (!data || data.value === undefined || data.value === null || data.value === '') return def;
-          return JSON.parse(data.value);
-        } catch (e) {
-          console.error('load failed', key, e);
-          return def;
-        }
+          var r = await window.storage.get(key, shared);
+          if (!r || typeof r.value === 'undefined') return def;
+          return JSON.parse(r.value);
+        } catch (e) { return def; }
       }
       async function saveKey(key, value, shared) {
-        if (shared === false) {
-          try {
-            localStorage.setItem('stampboard:' + key, JSON.stringify(value));
-            return true;
-          } catch (e) {
-            console.error('local save failed', key, e);
-            return false;
-          }
-        }
         try {
-          var res = await fetch(APPS_SCRIPT_URL, {
-            method: 'POST',
-            // text/plain이라 프리플라이트가 발생하지 않음 (Apps Script는 doOptions를 지원 안 함)
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({ action: 'set', key: key, value: JSON.stringify(value) })
-          });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          var data = await res.json();
-          if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'unknown error');
+          var r = await window.storage.set(key, JSON.stringify(value), shared);
+          if (!r) throw new Error('empty result');
           return true;
         } catch (e) {
           console.error('storage save failed', key, e);
@@ -1082,134 +975,6 @@
       }
 
       function uid(prefix) { return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
-
-      /* =========================================================
-         프린터 모듈 (Web Serial + ESC/POS + 완성형 한글 CP949 인코딩)
-         ---------------------------------------------------------
-         매장 QC 시스템(inventory-stamp-board 이전 버전 / 던킨 품질관리
-         시스템)에서 그대로 이식. 포트는 "빌려쓰기" 방식 - 출력할 때만
-         열고 끝나면 바로 닫아서, 같은 포트를 쓰는 다른 프로그램(POS 등)과
-         충돌하지 않는다.
-         ========================================================= */
-      // U+AC00~U+D7A3(가~힣) 11,172자를 CP949 2바이트로 변환하는 테이블.
-      // Python cp949 코덱으로 새로 생성해 전수 검증한 값(디코드 왕복 확인 완료)
-      // 이라, 손으로 옮겨 적다 생기는 인코딩 깨짐 위험이 없다.
-      var HANGUL_CP949_B64 = "PLACEHOLDER_HANGUL_TABLE";
-      var _hangulTable = null;
-      function getHangulTable() {
-        if (!_hangulTable) {
-          var bin = atob(HANGUL_CP949_B64);
-          var arr = new Uint8Array(bin.length);
-          for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-          _hangulTable = arr;
-        }
-        return _hangulTable;
-      }
-      function encodeKorean(text) {
-        var table = getHangulTable();
-        var out = [];
-        for (var idx = 0; idx < text.length; idx++) {
-          var cp = text.codePointAt(idx);
-          if (cp < 0x80) {
-            out.push(cp);
-          } else if (cp >= 0xAC00 && cp <= 0xD7A3) {
-            var i2 = (cp - 0xAC00) * 2;
-            out.push(table[i2], table[i2 + 1]);
-          } else {
-            out.push(0x3F); // 지원하지 않는 문자는 '?'로 대체 (한글 완성형 밖 문자 등)
-          }
-        }
-        return Uint8Array.from(out);
-      }
-
-      var savedPort = null; // 브라우저가 이미 권한을 부여한 포트 (재요청 팝업 방지용)
-      function setPrinterConnected(on) {
-        state.printerConnected = on;
-        var dot = document.getElementById('printerDot');
-        var text = document.getElementById('printerText');
-        if (dot) dot.classList.toggle('on', on);
-        if (text) text.textContent = on ? '프린터 연결됨' : '프린터 미연결';
-      }
-
-      async function connectPrinter() {
-        if (!('serial' in navigator)) {
-          alert('이 브라우저는 Web Serial을 지원하지 않습니다.\nChrome 또는 Edge에서 사용해주세요.');
-          return;
-        }
-        try {
-          savedPort = await navigator.serial.requestPort();
-          setPrinterConnected(true);
-          showToast('프린터 포트 권한 확인 완료');
-        } catch (e) {
-          console.error(e);
-        }
-      }
-
-      // CODE128(Code Set B) 바코드 인쇄 명령(GS k) 바이트 생성
-      function buildBarcodeBytes(code) {
-        var payload = '{B' + code; // CODE128 Code Set B 지정 프리픽스
-        var dataBytes = [];
-        for (var i = 0; i < payload.length; i++) dataBytes.push(payload.charCodeAt(i) & 0xFF);
-        return Uint8Array.from([
-          0x1D, 0x68, 50,           // GS h n : 바코드 높이
-          0x1D, 0x77, 2,             // GS w n : 모듈 너비
-          0x1D, 0x48, 0,             // GS H n : 바코드 아래 숫자(HRI) 미표시
-          0x1D, 0x66, 0,             // GS f n : HRI 폰트 A
-          0x1D, 0x6B, 73, dataBytes.length // GS k m n : CODE128 인쇄 시작(m=73)
-        ].concat(dataBytes));
-      }
-
-      // segments: [{type:'text', text}, {type:'barcode', code}, {type:'cut'}]
-      // 텍스트/바코드가 섞인 영수증을 순서대로 출력. 포트를 열고 쓰고 항상 닫는다.
-      async function printSegments(segments) {
-        var localPort = null;
-        try {
-          if (savedPort) {
-            localPort = savedPort;
-          } else {
-            localPort = await navigator.serial.requestPort();
-            savedPort = localPort;
-          }
-          await localPort.open({ baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', flowControl: 'none' });
-          setPrinterConnected(true);
-
-          var writer = localPort.writable.getWriter();
-          await writer.write(Uint8Array.from([0x1B, 0x40]));      // ESC @ : 초기화
-          await writer.write(Uint8Array.from([0x1B, 0x33, 20]));   // ESC 3 n : 줄간격 압축
-
-          for (var i = 0; i < segments.length; i++) {
-            var seg = segments[i];
-            if (seg.type === 'barcode') {
-              await writer.write(buildBarcodeBytes(seg.code));
-              await writer.write(Uint8Array.from([0x0A]));
-            } else if (seg.type === 'cut') {
-              await writer.write(Uint8Array.from([0x1B, 0x64, 0x02]));
-              await writer.write(Uint8Array.from([0x1D, 0x56, 0x00])); // GS V 0 : 중간 절단
-            } else {
-              await writer.write(Uint8Array.from([0x1C, 0x26]));  // FS & : 한글 모드 켜기
-              await writer.write(encodeKorean(seg.text));
-              await writer.write(Uint8Array.from([0x1C, 0x2E]));  // FS . : 한글 모드 끄기
-            }
-          }
-          await writer.write(Uint8Array.from([0x1B, 0x64, 0x05]));
-          await writer.write(Uint8Array.from([0x1D, 0x56, 0x00]));
-          writer.releaseLock();
-          showToast('출력 완료');
-        } catch (e) {
-          console.error(e);
-          alert('출력 오류: ' + (e.message || e));
-        } finally {
-          if (localPort) {
-            try { await localPort.close(); } catch (closeErr) { console.error('포트 닫기 실패:', closeErr); }
-          }
-          setPrinterConnected(false);
-        }
-      }
-
-      // 단순 텍스트만 출력 (세그먼트 없이 한 덩어리)
-      async function printText(text) {
-        await printSegments([{ type: 'text', text: text }, { type: 'cut' }]);
-      }
 
       /* ============ business logic ============ */
       function productByBarcode(bc) {
@@ -1337,152 +1102,6 @@
         showToast('가져오기 완료: 신규 ' + added + '건 · 수정 ' + updated + '건');
       }
 
-      /* =========================================================
-         위치별 재고현황 출력 - CSV 파싱
-         ---------------------------------------------------------
-         매장 QC 시스템이 내보내는 재고현황 CSV(예: INVENTORY_1_.csv)는
-         헤더가 없는 탭 구분 텍스트이며, 열 구성이 행마다 살짝 다르다
-         (해동/개봉/소분 등 이벤트별로 채워지는 선택 필드 수가 다름).
-         실제 샘플 데이터를 열 단위로 대조해 확인한 결과, 아래 6개 열만은
-         모든 정상 행에서 안정적으로 같은 의미를 가진다:
-           [1]=바코드 [2]=제품명 [3]=분류 [4]=수량
-           [9]=소비기한(YYYY-MM-DD) [11]=상태 [12]=개봉여부 [13]=위치코드 [14]=타임스탬프
-         그 외 열(5~8,10)은 소분일/해동일/안전보관일 등 이벤트별로만
-         채워지는 값이라 출력에는 쓰지 않는다 (신뢰도 낮음).
-         ========================================================= */
-      function parseLocationStatusCsv(text) {
-        var lines = String(text || '').split(/\r\n|\r|\n/);
-        var lots = [], errors = [];
-        for (var li = 0; li < lines.length; li++) {
-          var line = lines[li];
-          if (!line || !line.trim()) continue;
-          var cols = line.split('\t');
-          if (cols.length < 14) continue; // 열 수가 안 맞는 행(빈 줄, 깨진 행)은 조용히 건너뜀
-
-          var barcode = (cols[1] || '').trim();
-          var name = (cols[2] || '').trim();
-          var category = (cols[3] || '').trim() || '기타';
-          var qty = Number(cols[4]);
-          var expiry = (cols[9] || '').trim();
-          var status = (cols[11] || '').trim();
-          var openStatus = (cols[12] || '').trim();
-          var locCode = (cols[13] || '').trim();
-          var timestamp = (cols[14] || '').trim();
-
-          // 데이터 매핑 방어 로직: 바코드가 숫자 형식이 아니거나(깨진/미완성 행),
-          // 제품명이 비어있거나, 알 수 없는 위치 코드면 재고현황 출력에서 제외한다.
-          // (마지막 몇 줄처럼 상태값 칸에 타임스탬프가 잘못 들어간 미완성 행 등을 걸러냄)
-          if (!/^\d{6,14}$/.test(barcode)) { errors.push('줄 ' + (li + 1) + ': 바코드 형식이 아님 - 건너뜀'); continue; }
-          if (!name) { errors.push('줄 ' + (li + 1) + ' (' + barcode + '): 제품명 없음 - 건너뜀'); continue; }
-          if (!statusLocOf(locCode)) { continue; } // 위치 미지정/알 수 없는 코드 - 위치별 출력 대상 아님
-          if (!qty || qty <= 0) { continue; } // 수량 0(소진됨)은 "현재 재고현황"에서 제외
-          // 데이터 매핑 버그 주의: 이 CSV는 로트별 "현재 상태"가 아니라 이벤트 이력에
-          // 가깝다 - 같은 바코드가 여러 줄로 남아있고, 이미 소진된 로트도 수량 필드가
-          // 그대로 남아있는 경우가 있다(과거 값이 덮어써지지 않음). status가 '소진'인
-          // 행을 그대로 합치면 이미 없어진 재고가 다시 "있음"으로 잡히므로 제외한다.
-          if (status === '소진') { continue; }
-
-          // 소비기한 값에서 날짜 부분만 추출 (간혹 datetime 문자열이 섞여 들어오는 경우 방어)
-          var expiryDate = expiry ? expiry.slice(0, 10) : '';
-
-          lots.push({
-            barcode: barcode, name: name, category: category, qty: qty,
-            expiry: expiryDate, status: status || '정상', openStatus: openStatus,
-            locCode: locCode, timestamp: timestamp
-          });
-        }
-        return { lots: lots, errors: errors };
-      }
-
-      function expiryUrgency(expiryDate) {
-        if (!expiryDate) return 'none';
-        var d = daysLeft(expiryDate);
-        if (d === null) return 'none';
-        if (d <= 0) return 'danger';
-        if (d <= 1) return 'warn';
-        return 'safe';
-      }
-
-      // 위치 하나에 대한 재고현황 영수증 세그먼트(텍스트+바코드) 생성
-      function buildLocationStatusSegments(locCode, lots) {
-        var loc = statusLocOf(locCode);
-        var locName = loc ? loc.name : locCode;
-        var items = lots.filter(function (l) { return l.locCode === locCode; });
-
-        var byCategory = {};
-        var catOrder = [];
-        items.forEach(function (l) {
-          if (!byCategory[l.category]) { byCategory[l.category] = []; catOrder.push(l.category); }
-          byCategory[l.category].push(l);
-        });
-
-        var DIV = '================================';
-        var lines = [];
-        lines.push(DIV);
-        lines.push(centerText(locName + ' 재고현황'));
-        lines.push(DIV);
-        lines.push('출력시간 : ' + nowTimeStr());
-        lines.push('');
-
-        var segments = [];
-        var flush = function () { if (lines.length) { segments.push({ type: 'text', text: lines.join('\n') + '\n' }); lines = []; } };
-
-        if (items.length === 0) {
-          lines.push('(재고 없음)');
-          lines.push('');
-        } else {
-          catOrder.forEach(function (cat) {
-            lines.push('[' + cat + ']');
-            byCategory[cat].forEach(function (l) {
-              lines.push('- ' + l.name + ' x' + l.qty);
-              var statusText = l.status + (l.openStatus ? ' · ' + l.openStatus : '');
-              lines.push('  상태:' + statusText + '  소비기한:' + (l.expiry || '__________'));
-              if (l.barcode) {
-                flush();
-                segments.push({ type: 'barcode', code: l.barcode });
-              }
-            });
-            lines.push('');
-          });
-        }
-        lines.push(DIV);
-        lines.push('점검자 : ______________');
-        lines.push(DIV);
-        lines.push('');
-        flush();
-        segments.push({ type: 'cut' });
-        return segments;
-      }
-
-      // 전체 위치를 한 번에 출력할 때 쓰는, 위치별 세그먼트를 이어붙인 버전
-      function buildAllLocationsStatusSegments(lots) {
-        var segments = [];
-        STATUS_LOCATIONS.forEach(function (loc) {
-          var segs = buildLocationStatusSegments(loc.code, lots);
-          // 각 위치 사이는 절단해서 낱장처럼 뜯어쓸 수 있게 함 (마지막엔 cut이 이미 있음)
-          segments = segments.concat(segs);
-        });
-        return segments;
-      }
-
-      function centerText(str, width) {
-        width = width || 32;
-        var w = 0;
-        for (var i = 0; i < str.length; i++) { w += (str.codePointAt(i) > 0x1100 ? 2 : 1); }
-        var padLen = Math.max(0, Math.floor((width - w) / 2));
-        return new Array(padLen + 1).join(' ') + str;
-      }
-
-      // 미리보기용 텍스트 (바코드는 [바코드:코드] 형태로 표기)
-      function buildLocationStatusPreviewText(locCode, lots) {
-        var segs = locCode === 'ALL' ? buildAllLocationsStatusSegments(lots) : buildLocationStatusSegments(locCode, lots);
-        return segs.map(function (s) {
-          if (s.type === 'barcode') return '[바코드: ' + s.code + ']';
-          if (s.type === 'cut') return '✂ ---------- 절단 ----------';
-          return s.text;
-        }).join('\n');
-      }
-
       /* ============ toast ============ */
       var toastTimer = null;
       function showToast(msg) {
@@ -1499,13 +1118,7 @@
       /* ============ render ============ */
       function esc(s) {
         return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-          return {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#39;'
-          }[c];
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
         });
       }
 
@@ -1544,11 +1157,6 @@
           '</div>' +
           '<input class="staff-input" id="staffNameInput" placeholder="담당자 이름" value="' + esc(state.staffName) + '" maxlength="10">' +
           '<div class="search-wrap"><input id="headerSearch" placeholder="바코드/제품명 검색 후 Enter" value="' + (state.view === 'receive' ? esc(state.receiveFilter) : '') + '"></div>' +
-          '<div class="printer-status">' +
-          '<span class="printer-dot" id="printerDot"></span>' +
-          '<span id="printerText">' + (state.printerConnected ? '프린터 연결됨' : '프린터 미연결') + '</span>' +
-          '<button type="button" class="small" data-action="connect-printer">연결</button>' +
-          '</div>' +
           '</div>' +
           '<div class="tabs">' + tabsHtml + '</div>' +
           '</div>';
@@ -1579,10 +1187,7 @@
 
         return '' +
           banner +
-          '<div class="section-title" style="justify-content:space-between;">' +
-          '<span>보관 위치</span>' +
-          '<button type="button" class="btn btn-ghost" style="font-size:13px;" data-action="open-print-status">🖨️ 위치별 재고현황 출력</button>' +
-          '</div>' +
+          '<div class="section-title">보관 위치</div>' +
           '<div class="loc-grid">' + cards + '</div>';
       }
 
@@ -1798,31 +1403,6 @@
             '</div>' +
             '</div>';
         }
-        if (state.modal.type === 'printStatus') {
-          var locOptions = '<option value="ALL" ' + (state.statusSelectedLoc === 'ALL' ? 'selected' : '') + '>전체 위치 (모두 출력)</option>' +
-            STATUS_LOCATIONS.map(function (l) {
-              var cnt = state.statusCsvLots.filter(function (x) { return x.locCode === l.code; }).length;
-              return '<option value="' + l.code + '" ' + (state.statusSelectedLoc === l.code ? 'selected' : '') + '>' + l.name + ' (' + cnt + '건)</option>';
-            }).join('');
-          var errBox = state.statusCsvErrors.length
-            ? '<div style="font-size:11.5px; color:var(--danger); margin-top:6px;">' + state.statusCsvErrors.length + '건 인식 불가(건너뜀): ' + esc(state.statusCsvErrors.slice(0, 4).join(' / ')) + '</div>'
-            : '';
-          overlay.innerHTML = '' +
-            '<div class="modal-box" style="max-width:640px;">' +
-            '<div class="modal-title">위치별 재고현황 출력</div>' +
-            '<div class="modal-sub">재고현황 CSV 파일을 올리거나 아래에 붙여넣으세요 (탭 구분, 헤더 없음). 위치를 골라 미리보기 후 프린터로 출력할 수 있어요.</div>' +
-            '<div class="field"><label>CSV 파일 선택</label><input type="file" id="statusCsvFile" accept=".csv,.tsv,text/csv,text/tab-separated-values"></div>' +
-            '<div class="field"><label>또는 직접 붙여넣기</label><textarea id="statusCsvText" rows="6" style="width:100%; font-family:monospace; font-size:11px; border:1.5px solid var(--line); border-radius:12px; padding:10px;" placeholder="바코드	제품명	분류	수량	...(탭 구분)"></textarea></div>' +
-            errBox +
-            '<div class="field" style="margin-top:10px;"><label>출력할 위치</label><select id="statusLocSelect">' + locOptions + '</select></div>' +
-            '<div class="field"><label>미리보기</label><div id="statusPreviewBox" style="background:var(--bg); border:1.5px solid var(--line); border-radius:12px; padding:12px; font-family:monospace; font-size:11px; white-space:pre-wrap; max-height:260px; overflow-y:auto; color:var(--ink-soft);">' + esc(state.statusCsvLots.length ? buildLocationStatusPreviewText(state.statusSelectedLoc, state.statusCsvLots) : 'CSV를 불러오면 여기 미리보기가 표시돼요.') + '</div></div>' +
-            '<div class="modal-actions">' +
-            '<button class="btn btn-ghost btn-block" data-action="close-modal">닫기</button>' +
-            '<button class="btn btn-primary btn-block" data-action="print-status" ' + (state.statusCsvLots.length ? '' : 'disabled') + '>🖨️ 출력</button>' +
-            '</div>' +
-            '</div>';
-        }
-
         document.body.appendChild(overlay);
         overlay.addEventListener('click', function (e) { if (e.target === overlay) { state.modal = null; overlay.remove(); } });
 
@@ -1864,54 +1444,6 @@
             render();
           });
         }
-
-        var statusCsvFile = document.getElementById('statusCsvFile');
-        var statusCsvText = document.getElementById('statusCsvText');
-        var statusLocSelect = document.getElementById('statusLocSelect');
-
-        function applyStatusCsv(text) {
-          var res = parseLocationStatusCsv(text);
-          state.statusCsvLots = res.lots;
-          state.statusCsvErrors = res.errors;
-          if (res.lots.length === 0 && res.errors.length > 0) {
-            showToast('인식 가능한 재고현황 행이 없어요');
-          }
-          render();
-          state.modal = { type: 'printStatus' };
-          renderModal();
-        }
-
-        if (statusCsvFile) {
-          statusCsvFile.addEventListener('change', function () {
-            var file = statusCsvFile.files[0];
-            if (!file) return;
-            var reader = new FileReader();
-            reader.onload = function () { applyStatusCsv(String(reader.result || '')); };
-            reader.readAsText(file, 'utf-8');
-          });
-        }
-        if (statusCsvText) {
-          statusCsvText.addEventListener('change', function () {
-            if (statusCsvText.value.trim()) applyStatusCsv(statusCsvText.value);
-          });
-        }
-        if (statusLocSelect) {
-          statusLocSelect.addEventListener('change', function () {
-            state.statusSelectedLoc = statusLocSelect.value;
-            var box = document.getElementById('statusPreviewBox');
-            if (box) box.textContent = buildLocationStatusPreviewText(state.statusSelectedLoc, state.statusCsvLots);
-          });
-        }
-        var printStatusBtn = overlay.querySelector('[data-action="print-status"]');
-        if (printStatusBtn) {
-          printStatusBtn.addEventListener('click', async function () {
-            if (state.statusCsvLots.length === 0) return;
-            var segs = state.statusSelectedLoc === 'ALL'
-              ? buildAllLocationsStatusSegments(state.statusCsvLots)
-              : buildLocationStatusSegments(state.statusSelectedLoc, state.statusCsvLots);
-            await printSegments(segs);
-          });
-        }
       }
 
       /* ============ listeners ============ */
@@ -1929,8 +1461,6 @@
             render();
           });
         });
-        var connectPrinterBtn = app.querySelector('[data-action="connect-printer"]');
-        if (connectPrinterBtn) { connectPrinterBtn.addEventListener('click', connectPrinter); }
         var staffInput = document.getElementById('staffNameInput');
         if (staffInput) {
           staffInput.addEventListener('change', async function () {
@@ -1953,14 +1483,6 @@
 
       function attachViewListeners() {
         var app = document.getElementById('app');
-
-        var openPrintStatusBtn = app.querySelector('[data-action="open-print-status"]');
-        if (openPrintStatusBtn) {
-          openPrintStatusBtn.addEventListener('click', function () {
-            state.modal = { type: 'printStatus' };
-            render();
-          });
-        }
 
         // location detail actions
         app.querySelectorAll('[data-action="advance"]').forEach(function (btn) {
