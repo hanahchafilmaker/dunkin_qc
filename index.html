@@ -1117,7 +1117,7 @@
           var toAction = obj.toAction || 'EXPIRY';
           var fromAction = obj.fromAction || 'EXPIRY';
           var p = {
-            barcode: obj.barcode,
+            barcode: String(obj.barcode),
             storage: obj.storage || 'OTHER',
             productName: obj.productName || obj.barcode,
             fromLocation: obj.fromLocation || '',
@@ -1297,8 +1297,8 @@
         var filtered = state.products.filter(function (p) {
           if (!filter) return true;
 
-          var productName = String(p.productName || '').toLowerCase();
-          var barcode = String(p.barcode || '').toLowerCase();
+          const productName = String(p.productName || '').toLowerCase();
+          const barcode = String(p.barcode || '').toLowerCase();
 
           return (
             productName.indexOf(filter) >= 0 ||
@@ -1650,7 +1650,7 @@
             if (!barcode) { showToast('바코드를 입력해주세요'); return; }
             var toAction = fd.get('toAction');
             var p = {
-              barcode: barcode,
+              barcode: String(barcode),
               productName: (fd.get('productName') || '').trim(),
               storage: fd.get('storage'),
               fromLocation: fd.get('fromLocation'),
