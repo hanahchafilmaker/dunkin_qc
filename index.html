@@ -1020,7 +1020,14 @@
 
       /* ============ business logic ============ */
       function productByBarcode(bc) {
-        for (var i = 0; i < state.products.length; i++) { if (state.products[i].barcode === bc) return state.products[i]; }
+        for (var i = 0; i < state.products.length; i++) {
+          if (
+            String(state.products[i].barcode) ===
+            String(bc)
+          ) {
+            return state.products[i];
+          }
+        }
         return null;
       }
 
@@ -1293,6 +1300,8 @@
 
       /* ---------- receive ---------- */
       function renderReceive() {
+        console.log(state.receiveSelected);
+        console.log(productByBarcode(state.receiveSelected));
         var filter = (state.receiveFilter || '').trim().toLowerCase();
         var filtered = state.products.filter(function (p) {
           if (!filter) return true;
@@ -1318,7 +1327,9 @@
         var pickList = '<div class="product-pick-list">' +
           (filtered.length === 0 ? '<div style="padding:16px; color:var(--ink-soft); font-size:13.5px;">검색 결과가 없어요.</div>' :
             filtered.map(function (p) {
-              var isSel = sel && sel.barcode === p.barcode;
+              var isSel =
+                sel &&
+                String(sel.barcode) === String(p.barcode);
               return '<div class="product-pick-item ' + (isSel ? 'selected' : '') + '" data-action="pick-product" data-barcode="' + esc(p.barcode) + '">' +
                 '<div><div class="pp-name">' + esc(p.productName) + '</div><div class="pp-sub">' + esc(p.barcode) + ' · ' + esc(locOf(p.fromLocation) ? locOf(p.fromLocation).name : p.fromLocation) + ' · ' + (TO_ACTION_LABEL[p.toAction] || p.toAction) + '</div></div>' +
                 '<button class="pick-btn" data-action="pick-product" data-barcode="' + esc(p.barcode) + '">' + (isSel ? '선택됨' : '선택') + '</button>' +
@@ -1566,7 +1577,13 @@
         }
         app.querySelectorAll('[data-action="pick-product"]').forEach(function (btn) {
           btn.addEventListener('click', function () {
-            state.receiveSelected = btn.getAttribute('data-barcode');
+
+            console.log("clicked");
+            console.log(btn.getAttribute('data-barcode'));
+
+            state.receiveSelected =
+              btn.getAttribute('data-barcode');
+
             render();
           });
         });
