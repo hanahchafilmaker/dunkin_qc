@@ -1296,7 +1296,14 @@
         var filter = (state.receiveFilter || '').trim().toLowerCase();
         var filtered = state.products.filter(function (p) {
           if (!filter) return true;
-          return p.productName.toLowerCase().indexOf(filter) >= 0 || p.barcode.toLowerCase().indexOf(filter) >= 0;
+
+          var productName = String(p.productName || '').toLowerCase();
+          var barcode = String(p.barcode || '').toLowerCase();
+
+          return (
+            productName.indexOf(filter) >= 0 ||
+            barcode.indexOf(filter) >= 0
+          );
         });
 
         if (state.products.length === 0) {
