@@ -953,6 +953,27 @@
           return false;
         }
       }
+
+      async function loadAll() {
+        state.loading = true;
+        render();
+
+        var results = await Promise.all([
+          loadKey('products', []),
+          loadKey('inventory', []),
+          loadKey('actionlog', []),
+          loadKey('staffName', '')
+        ]);
+
+        state.products = results[0];
+        state.inventory = results[1];
+        state.log = results[2];
+        state.staffName = results[3];
+
+        state.loading = false;
+        render();
+      }
+
       /* ============ date helpers ============ */
       function pad(n) { return String(n).padStart(2, '0'); }
       function fmtLocal(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
