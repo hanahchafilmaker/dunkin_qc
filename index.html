@@ -1287,6 +1287,17 @@
       async function receiveStock(product, qty, expiry, openDate, locationOverride) {
         var steps = stepsFor(product);
         var base = todayStr();
+        var openD = product.fromAction === 'OPEN' ? (openDate || base) : '';
+
+        // 안전보관일 자동 계산: 전환 액션(개봉/소분/해동)이 있는 제품은
+        // 입고 시점(개봉일이 있으면 개봉일)을 기준으로 우선 계산해둔다.
+        // 실제로 해동/개봉/소분 버튼을 누르면 advanceLot()에서 그 시점 기준으로 다시 계산되어 갱신됨.
+        var initialSafeUntil = '';
+        if (product.toAction && product.toAction !== 'EXPIRY' && product.safeUntil) {
+          var safeBase = openD || base;
+          initialSafeUntil = addDays(safeBase, product.safeUntil);
+        }
+
         var lot = {
           lotId: uid('LOT'),
           barcode: product.barcode,
@@ -1295,9 +1306,9 @@
           location: locationOverride || product.fromLocation,
           status: steps[0].name,
           baseDate: base,
-          safeUntil: '',
+          safeUntil: initialSafeUntil,
           expiry: expiry || '',
-          openDate: product.fromAction === 'OPEN' ? (openDate || base) : '',
+          openDate: openD,
           createdAt: nowTimeStr()
         };
         state.inventory.push(lot);
