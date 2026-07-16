@@ -1100,9 +1100,11 @@
             lines.push('[' + cat + ']');
             byCategory[cat].forEach(function (l) {
               var dl = daysLeft(deadlineOf(l));
-              lines.push('- ' + l.productName + ' x' + l.qty);
-              lines.push('  상태:' + l.status + '  기한:' + (deadlineOf(l) || '__________') + ' (' + urgencyText(dl) + ')');
-              if (l.barcode) {
+              lines.push('- ' + l.productName);
+              lines.push('  상태 : ' + l.status);
+              lines.push('  보관장소 : ' + (locOf(l.location) ? locOf(l.location).name : l.location));
+              lines.push('  소비기한 : ' + (l.expiry || '-'));
+              lines.push('  안전보관일 : ' + (l.safeUntil || '-')); if (l.barcode) {
                 flush();
                 segments.push({ type: 'barcode', code: l.barcode });
               }
