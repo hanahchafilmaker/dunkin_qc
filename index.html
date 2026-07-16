@@ -1138,14 +1138,14 @@
 
       /* ============ render ============ */
       function esc(s) {
-        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return String(s == null ? '' : s).replace(/[&&lt;&gt;"']/g, function (c) {
           return {
             '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
+            '&lt;': '&lt;',
+            '&gt;': '&gt;',
             '"': '&quot;',
-            "'": '&#39;'
-          }[c];
+            "'":
+    }[c];
         });
       }
 
