@@ -1131,17 +1131,14 @@
       // 로트 1건에 대한 영수증(라벨) 세그먼트 생성
       function buildLotReceiptSegments(lot) {
         var DIV = '================================';
-        var dl = daysLeft(deadlineOf(lot));
         var lines = [];
         lines.push(DIV);
         lines.push(centerText(lot.productName));
         lines.push(DIV);
-        lines.push('수량 : ' + lot.qty + '개');
         lines.push('상태 : ' + lot.status);
-        lines.push('위치 : ' + (locOf(lot.location) ? locOf(lot.location).name : lot.location));
-        lines.push('기한 : ' + (deadlineOf(lot) || '-') + ' (' + urgencyText(dl) + ')');
-        lines.push('담당자 : ' + (state.staffName || '미입력'));
-        lines.push('출력시간 : ' + nowTimeStr());
+        lines.push('보관장소 : ' + (locOf(lot.location) ? locOf(lot.location).name : lot.location));
+        lines.push('소비기한 : ' + (lot.expiry || '-'));
+        lines.push('안전보관일 : ' + (lot.safeUntil || '-'));
         lines.push(DIV);
         lines.push('');
         var segments = [{ type: 'text', text: lines.join('\n') + '\n' }];
