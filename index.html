@@ -19,6 +19,40 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Do+Hyeon&family=Noto+Sans+KR:wght@400;500;700;900&display=swap"
     rel="stylesheet">
+
+  <script>
+    // 1. Google Apps Script URL 설정
+    const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzzrenkdvwa8LqmAC_-M4HpfLLRYaT4DG3XjRedpxfpdauOmnNODasYr8x4YfU0zgQX/exec";
+
+    // 2. 데이터 불러오기 함수
+    async function loadKey(key, def) {
+      try {
+        const response = await fetch(`${SCRIPT_URL}?key=${key}`);
+        return await response.json();
+      } catch (e) {
+        console.error("데이터 로드 실패:", e);
+        return def;
+      }
+    }
+
+    // 3. 내비게이션 기능 (화면 전환)
+    function initNavigation() {
+      document.querySelectorAll('[data-nav]').forEach(el => {
+        el.addEventListener('click', (e) => {
+          const target = e.target.getAttribute('data-nav');
+          console.log("이동할 화면:", target);
+          // 여기서 실제 화면을 보여주는 로직을 실행 (예: document.getElementById(target).style.display = 'block')
+        });
+      });
+    }
+
+    // 4. 앱 초기화
+    window.addEventListener('load', () => {
+      initNavigation();
+      console.log("내비게이션 연결 완료");
+    });
+  </script>
+
   <style>
     :root {
       --bg: #F7F5F1;
